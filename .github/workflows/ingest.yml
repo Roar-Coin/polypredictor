@@ -1,0 +1,54 @@
+# Legg denne i .github/workflows/ingest.yml i repoet ditt.
+# Kjører ingestion i skyen — start manuelt fra Actions-fanen, eller på schedule.
+# Data lastes opp som artifact (gratis). Bytt til R2-opplasting når datasettet vokser.
+
+name: polymarket-ingest
+
+on:
+  workflow_dispatch:
+    inputs:
+      fidelity:
+        description: "Oppløsning i minutter (60 = time)"
+        default: "60"
+      category:
+        description: "Kategori (tom = alle)"
+        default: ""
+      min_volume:
+        description: "Min. volum i USD"
+        default: "1000"
+  schedule:
+    - cron: "0 3 * * *"   # nattlig oppdatering 03:00 UTC
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # maks ~6t per kjøring; checkpoint gjør at neste kjøring fortsetter
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore checkpoint + data
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: poly-data-${{ github.run_id }}
+          restore-keys: poly-data-
+
+      - name: Install deps
+        run: pip install requests pandas pyarrow tenacity
+
+      - name: Run ingestion
+        run: |
+          ARGS="--fidelity ${{ inputs.fidelity || '60' }} --min-volume ${{ inputs.min_volume || '1000' }}"
+          if [ -n "${{ inputs.category }}" ]; then ARGS="$ARGS --category ${{ inputs.category }}"; fi
+          python ingest.py $ARGS
+
+      - name: Upload data as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: polymarket-data
+          path: data/
+          retention-days: 30
