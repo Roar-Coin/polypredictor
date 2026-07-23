@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Polymarket ingestion v2 — robust paginering + tydelig feillogging.
-Se README for bruk. Lim denne over den gamle ingest.py i repoet.
+Polymarket ingestion v3 — henter markeder maaned for maaned (unngaar dype offsets),
+og hopper over markeder uten CLOB-historikk med tydelig logging.
 """
 
 import argparse
 import json
 import time
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -18,9 +19,10 @@ CLOB = "https://clob.polymarket.com"
 DATA_DIR = Path("data")
 PRICES_DIR = DATA_DIR / "prices"
 CHECKPOINT = DATA_DIR / "checkpoint.json"
+META_DONE = DATA_DIR / "meta_complete.flag"
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "poly-backtester-ingest/0.2"})
+SESSION.headers.update({"User-Agent": "poly-backtester-ingest/0.3"})
 
 CATEGORY_KEYWORDS = {
     "crypto": ["bitcoin", "btc", "ethereum", "eth", "solana", "crypto", "doge"],
@@ -44,8 +46,7 @@ def categorize(market: dict) -> str:
     return "other"
 
 
-def get_json(url: str, params: dict | None = None, attempts: int = 5):
-    """GET med backoff. Logger statuskode + svar ved feil. Returnerer None hvis alt feiler."""
+def get_json(url, params=None, attempts=5):
     for attempt in range(1, attempts + 1):
         try:
             r = SESSION.get(url, params=params, timeout=30)
@@ -57,19 +58,19 @@ def get_json(url: str, params: dict | None = None, attempts: int = 5):
             try:
                 return r.json()
             except ValueError:
-                print(f"  ! ugyldig JSON ({attempt}/{attempts}): {r.text[:200]}", flush=True)
+                print(f"  ! ugyldig JSON: {r.text[:200]}", flush=True)
         elif r.status_code == 429:
             wait = int(r.headers.get("Retry-After", 0)) or min(10 * attempt, 120)
-            print(f"  ! rate limit 429, venter {wait}s", flush=True)
+            print(f"  ! rate limit, venter {wait}s", flush=True)
             time.sleep(wait)
             continue
         else:
-            print(f"  ! HTTP {r.status_code} pa {url} params={params}: {r.text[:200]}", flush=True)
+            print(f"  ! HTTP {r.status_code} params={params}: {r.text[:200]}", flush=True)
         time.sleep(min(2 ** attempt, 60))
     return None
 
 
-def parse_market(m: dict) -> dict:
+def parse_market(m):
     token_ids = m.get("clobTokenIds")
     if isinstance(token_ids, str):
         try:
@@ -97,35 +98,42 @@ def parse_market(m: dict) -> dict:
     }
 
 
+def month_windows(start_year=2020):
+    """(fra, til)-par per maaned frem til i dag."""
+    windows = []
+    y, m = start_year, 1
+    today = date.today()
+    while (y, m) <= (today.year, today.month):
+        ny, nm = (y + 1, 1) if m == 12 else (y, m + 1)
+        windows.append((f"{y}-{m:02d}-01T00:00:00Z", f"{ny}-{nm:02d}-01T00:00:00Z"))
+        y, m = ny, nm
+    return windows
+
+
 def fetch_all_markets() -> pd.DataFrame:
-    """Paginert henting. Faller tilbake til mindre sidestorrelse hvis et offset feiler."""
     rows = []
-    offset = 0
-    while True:
-        batch = None
-        for limit in (500, 100, 20):
+    for start, end in month_windows():
+        offset, month_count = 0, 0
+        while True:
             batch = get_json(f"{GAMMA}/markets", {
-                "closed": "true", "limit": limit, "offset": offset,
-                "order": "id", "ascending": "true",
-            }, attempts=3)
-            if batch is not None:
+                "closed": "true", "limit": 500, "offset": offset,
+                "end_date_min": start, "end_date_max": end,
+            }, attempts=4)
+            if batch is None:
+                print(f"  !! hopper over resten av vindu {start[:7]} ved offset {offset}", flush=True)
                 break
-            print(f"  ! offset {offset} feilet med limit={limit}, prover mindre side", flush=True)
-        if batch is None:
-            print(f"  !! gir opp ved offset {offset} — lagrer det vi har ({len(rows)} markeder)", flush=True)
-            break
-        if not batch:
-            break  # tom liste = ferdig
-        rows.extend(parse_market(m) for m in batch)
-        offset += len(batch)
-        if offset % 2000 < len(batch):
-            print(f"  markets fetched: {offset}", flush=True)
-        time.sleep(0.5)
+            if not batch:
+                break
+            rows.extend(parse_market(m) for m in batch)
+            month_count += len(batch)
+            offset += len(batch)
+            time.sleep(0.4)
+        print(f"  {start[:7]}: {month_count} markeder (totalt {len(rows)})", flush=True)
     df = pd.DataFrame(rows).drop_duplicates(subset="market_id")
     return df
 
 
-def fetch_price_history(token_id: str, fidelity: int) -> pd.DataFrame | None:
+def fetch_price_history(token_id, fidelity):
     data = get_json(f"{CLOB}/prices-history", {
         "market": token_id, "interval": "max", "fidelity": fidelity,
     }, attempts=3)
@@ -139,13 +147,13 @@ def fetch_price_history(token_id: str, fidelity: int) -> pd.DataFrame | None:
     return df.rename(columns={"t": "timestamp", "p": "price"})
 
 
-def load_checkpoint() -> set:
+def load_checkpoint():
     if CHECKPOINT.exists():
         return set(json.loads(CHECKPOINT.read_text()))
     return set()
 
 
-def save_checkpoint(done: set):
+def save_checkpoint(done):
     CHECKPOINT.write_text(json.dumps(sorted(done)))
 
 
@@ -154,31 +162,40 @@ def main():
     ap.add_argument("--fidelity", type=int, default=60)
     ap.add_argument("--category", default=None)
     ap.add_argument("--min-volume", type=float, default=0)
+    ap.add_argument("--since", default=None,
+                    help="Kun markeder avsluttet etter denne datoen, f.eks. 2024-01-01")
     args = ap.parse_args()
 
     DATA_DIR.mkdir(exist_ok=True)
     PRICES_DIR.mkdir(exist_ok=True)
 
     markets_path = DATA_DIR / "markets.parquet"
-    if markets_path.exists():
+    if markets_path.exists() and META_DONE.exists():
         markets = pd.read_parquet(markets_path)
-        print(f"Bruker eksisterende metadata: {len(markets)} markeder")
+        print(f"Bruker komplett metadata: {len(markets)} markeder")
     else:
-        print("Henter alle markeder fra Gamma ...")
+        if markets_path.exists():
+            print("Fant ufullstendig metadata fra tidligere kjoring — henter paa nytt.")
+        print("Henter alle markeder (maaned for maaned) ...")
         markets = fetch_all_markets()
         if markets.empty:
-            raise SystemExit("Fikk ingen markeder — se loggen over for HTTP-feil.")
+            raise SystemExit("Fikk ingen markeder — se loggen for HTTP-feil.")
         markets.to_parquet(markets_path, index=False)
+        META_DONE.write_text("ok")
         print(f"Lagret {len(markets)} markeder -> {markets_path}")
 
     sel = markets
+    if args.since:
+        sel = sel[sel["end_date"].fillna("") >= args.since]
     if args.category:
         sel = sel[sel["category"] == args.category]
     if args.min_volume > 0:
         sel = sel[sel["volume"] >= args.min_volume]
+    sel = sel[sel["token_ids"] != "[]"]
     print(f"Henter prishistorikk for {len(sel)} markeder (fidelity={args.fidelity}m)")
 
     done = load_checkpoint()
+    no_history = 0
     for i, (_, m) in enumerate(sel.iterrows(), 1):
         mid = str(m["market_id"])
         if mid in done:
@@ -194,12 +211,14 @@ def main():
             out_dir = PRICES_DIR / m["category"]
             out_dir.mkdir(exist_ok=True)
             pd.concat(frames).to_parquet(out_dir / f"{mid}.parquet", index=False)
+        else:
+            no_history += 1
         done.add(mid)
         if i % 50 == 0:
             save_checkpoint(done)
-            print(f"  {i}/{len(sel)} markeder ferdig", flush=True)
+            print(f"  {i}/{len(sel)} ferdig ({no_history} uten historikk)", flush=True)
     save_checkpoint(done)
-    print("Ferdig.")
+    print(f"Ferdig. {no_history} markeder manglet CLOB-historikk.")
 
 
 if __name__ == "__main__":
