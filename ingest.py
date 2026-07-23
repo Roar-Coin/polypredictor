@@ -164,7 +164,10 @@ def main():
     ap.add_argument("--min-volume", type=float, default=0)
     ap.add_argument("--since", default=None,
                     help="Kun markeder avsluttet etter denne datoen, f.eks. 2024-01-01")
+    ap.add_argument("--max-seconds", type=int, default=18900,
+                    help="Avslutt pent etter saa mange sekunder (default 5t15m)")
     args = ap.parse_args()
+    t0 = time.monotonic()
 
     DATA_DIR.mkdir(exist_ok=True)
     PRICES_DIR.mkdir(exist_ok=True)
@@ -197,6 +200,11 @@ def main():
     done = load_checkpoint()
     no_history = 0
     for i, (_, m) in enumerate(sel.iterrows(), 1):
+        if time.monotonic() - t0 > args.max_seconds:
+            save_checkpoint(done)
+            print(f"Tidsbudsjett naadd — lagrer og avslutter pent. "
+                  f"({len(done)} markeder ferdig, {no_history} uten historikk)", flush=True)
+            return
         mid = str(m["market_id"])
         if mid in done:
             continue
