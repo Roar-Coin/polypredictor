@@ -19,6 +19,7 @@ CLOB = "https://clob.polymarket.com"
 DATA_DIR = Path("data")
 PRICES_DIR = DATA_DIR / "prices"
 CHECKPOINT = DATA_DIR / "checkpoint.json"
+NOHISTORY = DATA_DIR / "nohistory.json"
 META_DONE = DATA_DIR / "meta_complete.flag"
 
 SESSION = requests.Session()
@@ -186,6 +187,16 @@ def save_checkpoint(done):
     CHECKPOINT.write_text(json.dumps(sorted(done)))
 
 
+def load_nohistory():
+    if NOHISTORY.exists():
+        return set(json.loads(NOHISTORY.read_text()))
+    return set()
+
+
+def save_nohistory(nohist):
+    NOHISTORY.write_text(json.dumps(sorted(nohist)))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fidelity", type=int, default=60)
@@ -245,20 +256,38 @@ def main():
     sel = sel[sel["token_ids"] != "[]"]
     print(f"Henter prishistorikk for {len(sel)} markeder (fidelity={args.fidelity}m)")
 
-    done = load_checkpoint()
-    no_history = 0
+    on_disk = {f.stem for f in PRICES_DIR.glob("*/*.parquet")}
+    nohist = load_nohistory()
+    old_done = load_checkpoint()
+    done = on_disk | nohist
+    lost = len(old_done - done)
+    print(f"Verifisert checkpoint: {len(on_disk)} filer paa disk, "
+          f"{len(nohist)} bekreftet uten historikk"
+          + (f", {lost} tidligere 'ferdige' uten fil — proves paa nytt" if lost else ""),
+          flush=True)
+    save_checkpoint(done)
+
+    def stop_cleanly():
+        save_checkpoint(done)
+        save_nohistory(nohist)
+        print(f"Tidsbudsjett naadd — lagrer og avslutter pent. "
+              f"({len(done)}/{len(sel)} avklart, {len(nohist)} uten historikk totalt)", flush=True)
+
     for i, (_, m) in enumerate(sel.iterrows(), 1):
         if time.monotonic() - t0 > args.max_seconds:
-            save_checkpoint(done)
-            print(f"Tidsbudsjett naadd — lagrer og avslutter pent. "
-                  f"({len(done)} markeder ferdig, {no_history} uten historikk)", flush=True)
+            stop_cleanly()
             return
         mid = str(m["market_id"])
         if mid in done:
             continue
         frames = []
+        used_fallback = False
         for j, tok in enumerate(json.loads(m["token_ids"])):
             df = fetch_price_history(tok, args.fidelity)
+            if df is None and args.fidelity > 1:
+                df = fetch_price_history(tok, 1)   # kortlivet marked? prov minuttdata
+                if df is not None:
+                    used_fallback = True
             if df is not None:
                 df["outcome_index"] = j
                 frames.append(df)
@@ -266,15 +295,20 @@ def main():
         if frames:
             out_dir = PRICES_DIR / m["category"]
             out_dir.mkdir(exist_ok=True)
+            if used_fallback:
+                for fr in frames:
+                    fr["fidelity_min"] = 1
             pd.concat(frames).to_parquet(out_dir / f"{mid}.parquet", index=False)
         else:
-            no_history += 1
+            nohist.add(mid)
         done.add(mid)
         if i % 50 == 0:
             save_checkpoint(done)
-            print(f"  {i}/{len(sel)} ferdig ({no_history} uten historikk)", flush=True)
+            save_nohistory(nohist)
+            print(f"  {i}/{len(sel)} ferdig ({len(nohist)} uten historikk)", flush=True)
     save_checkpoint(done)
-    print(f"Ferdig. {no_history} markeder manglet CLOB-historikk.")
+    save_nohistory(nohist)
+    print(f"Ferdig. {len(nohist)} markeder manglet CLOB-historikk.")
 
 
 if __name__ == "__main__":
