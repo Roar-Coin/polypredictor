@@ -24,24 +24,52 @@ META_DONE = DATA_DIR / "meta_complete.flag"
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "poly-backtester-ingest/0.3"})
 
-CATEGORY_KEYWORDS = {
-    "crypto": ["bitcoin", "btc", "ethereum", "eth", "solana", "crypto", "doge"],
-    "politics": ["election", "president", "senate", "congress", "trump", "biden",
-                 "parliament", "minister", "vote", "poll"],
-    "sports": ["nba", "nfl", "mlb", "nhl", "ufc", "premier league", "champions league",
-               "world cup", "super bowl", "vs.", "match", "game winner"],
-    "economy": ["fed", "rate", "inflation", "cpi", "gdp", "recession", "jobs report"],
+import re as _re
+
+TAG_MAP = {
+    "crypto": "crypto", "bitcoin": "crypto", "ethereum": "crypto", "solana": "crypto",
+    "memecoins": "crypto", "stablecoins": "crypto", "defi": "crypto", "nft": "crypto",
+    "politics": "politics", "elections": "politics", "geopolitics": "politics",
+    "us-current-affairs": "politics", "world": "politics", "trump": "politics",
+    "sports": "sports", "nba": "sports", "nfl": "sports", "mlb": "sports",
+    "nhl": "sports", "soccer": "sports", "epl": "sports", "ufc": "sports",
+    "mma": "sports", "tennis": "sports", "golf": "sports", "esports": "sports",
+    "olympics": "sports", "formula-1": "sports", "cricket": "sports",
+    "economy": "economy", "fed": "economy", "macro": "economy", "finance": "economy",
+    "business": "economy", "economics": "economy",
 }
+
+CATEGORY_KEYWORDS = {
+    "crypto": ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crypto",
+               "doge", "dogecoin", "xrp", "memecoin", "altcoin"],
+    "politics": ["election", "president", "senate", "congress", "trump", "biden",
+                 "parliament", "minister", "vote", "poll", "ceasefire", "impeach"],
+    "sports": ["nba", "nfl", "mlb", "nhl", "ufc", "premier league", "champions league",
+               "world cup", "super bowl", "grand slam", "wimbledon", "goalscorer",
+               "playoffs", "draft"],
+    "economy": ["fed", "rate hike", "rate cut", "inflation", "cpi", "gdp",
+                "recession", "jobs report", "tariff"],
+}
+_WORD_RES = {cat: [_re.compile(r"\b" + _re.escape(w) + r"\b") for w in words]
+             for cat, words in CATEGORY_KEYWORDS.items()}
+
+
+def tag_labels(market: dict):
+    out = []
+    for t in (market.get("tags") or []):
+        label = t.get("slug") or t.get("label") if isinstance(t, dict) else str(t)
+        if label:
+            out.append(str(label).lower())
+    return out
 
 
 def categorize(market: dict) -> str:
-    text = " ".join([
-        str(market.get("question", "")),
-        " ".join(t.get("label", "") if isinstance(t, dict) else str(t)
-                 for t in (market.get("tags") or [])),
-    ]).lower()
-    for cat, words in CATEGORY_KEYWORDS.items():
-        if any(w in text for w in words):
+    for label in tag_labels(market):
+        if label in TAG_MAP:
+            return TAG_MAP[label]
+    text = str(market.get("question", "")).lower()
+    for cat, regexes in _WORD_RES.items():
+        if any(r.search(text) for r in regexes):
             return cat
     return "other"
 
@@ -85,6 +113,7 @@ def parse_market(m):
             outcomes = []
     return {
         "market_id": str(m.get("id")),
+        "tags": json.dumps(tag_labels(m)),
         "condition_id": m.get("conditionId"),
         "question": m.get("question"),
         "category": categorize(m),
@@ -173,10 +202,15 @@ def main():
     PRICES_DIR.mkdir(exist_ok=True)
 
     markets_path = DATA_DIR / "markets.parquet"
+    meta_ok = False
     if markets_path.exists() and META_DONE.exists():
         markets = pd.read_parquet(markets_path)
-        print(f"Bruker komplett metadata: {len(markets)} markeder")
-    else:
+        if "tags" in markets.columns:
+            meta_ok = True
+            print(f"Bruker komplett metadata: {len(markets)} markeder")
+        else:
+            print("Metadata mangler tags (gammel versjon) — henter paa nytt for riktig kategorisering.")
+    if not meta_ok:
         if markets_path.exists():
             print("Fant ufullstendig metadata fra tidligere kjoring — henter paa nytt.")
         print("Henter alle markeder (maaned for maaned) ...")
@@ -186,6 +220,20 @@ def main():
         markets.to_parquet(markets_path, index=False)
         META_DONE.write_text("ok")
         print(f"Lagret {len(markets)} markeder -> {markets_path}")
+
+    # Rydd: flytt prisfiler som ligger i feil kategorimappe
+    cat_by_id = dict(zip(markets["market_id"].astype(str), markets["category"]))
+    moved = 0
+    if PRICES_DIR.exists():
+        for f in PRICES_DIR.glob("*/*.parquet"):
+            correct = cat_by_id.get(f.stem)
+            if correct and f.parent.name != correct:
+                dest = PRICES_DIR / correct
+                dest.mkdir(exist_ok=True)
+                f.rename(dest / f.name)
+                moved += 1
+    if moved:
+        print(f"Flyttet {moved} prisfiler til riktig kategorimappe.")
 
     sel = markets
     if args.since:
