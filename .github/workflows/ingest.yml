@@ -52,6 +52,26 @@ jobs:
           path: data
           key: poly-data-${{ github.run_id }}
 
+      - name: Publish to R2
+        if: always()
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+        run: |
+          if [ -z "$R2_ACCOUNT_ID" ]; then
+            echo "R2-secrets ikke satt — hopper over publisering."; exit 0
+          fi
+          if [ ! -d data/publish ]; then
+            echo "Ingen publish-mappe denne kjoringen."; exit 0
+          fi
+          pip install --quiet awscli
+          aws s3 sync data/publish "s3://hindsight-data/" \
+            --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          echo "Publisert til R2."
+
       - name: Upload data as artifact
         if: always()
         uses: actions/upload-artifact@v4
