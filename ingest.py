@@ -1,81 +1,370 @@
-# .github/workflows/ingest.yml — v2
-# Lagrer cache + artifact UANSETT utfall, saa fremdrift aldri gaar tapt.
+#!/usr/bin/env python3
+"""
+Polymarket ingestion v3 — henter markeder maaned for maaned (unngaar dype offsets),
+og hopper over markeder uten CLOB-historikk med tydelig logging.
+"""
 
-name: polymarket-ingest
+import argparse
+import json
+import time
+from datetime import date, timedelta
+from pathlib import Path
 
-on:
-  schedule:
-    - cron: "17 4 * * *"   # hver natt 04:17 UTC — fanger data foer den prunes
-  workflow_dispatch:
-    inputs:
-      fidelity:
-        description: "Opplosning i minutter (60 = time)"
-        default: "60"
-      category:
-        description: "Kategori (tom = alle)"
-        default: ""
-      min_volume:
-        description: "Min. volum i USD"
-        default: "1000"
+import pandas as pd
+import requests
 
-jobs:
-  ingest:
-    runs-on: ubuntu-latest
-    timeout-minutes: 350
-    steps:
-      - uses: actions/checkout@v4
+GAMMA = "https://gamma-api.polymarket.com"
+CLOB = "https://clob.polymarket.com"
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+DATA_DIR = Path("data")
+PRICES_DIR = DATA_DIR / "prices"
+CHECKPOINT = DATA_DIR / "checkpoint.json"
+NOHISTORY = DATA_DIR / "nohistory.json"
+META_DONE = DATA_DIR / "meta_complete.flag"
 
-      - name: Restore checkpoint + data
-        uses: actions/cache/restore@v4
-        with:
-          path: data
-          key: poly-data-${{ github.run_id }}
-          restore-keys: poly-data-
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "poly-backtester-ingest/0.3"})
 
-      - name: Install deps
-        run: pip install requests pandas pyarrow
+import re as _re
 
-      - name: Run ingestion
-        run: |
-          ARGS="--fidelity ${{ inputs.fidelity || '60' }} --min-volume ${{ inputs.min_volume || '1000' }}"
-          if [ -n "${{ inputs.category }}" ]; then ARGS="$ARGS --category ${{ inputs.category }}"; fi
-          python ingest.py $ARGS
+TAG_MAP = {
+    "crypto": "crypto", "bitcoin": "crypto", "ethereum": "crypto", "solana": "crypto",
+    "memecoins": "crypto", "stablecoins": "crypto", "defi": "crypto", "nft": "crypto",
+    "politics": "politics", "elections": "politics", "geopolitics": "politics",
+    "us-current-affairs": "politics", "world": "politics", "trump": "politics",
+    "sports": "sports", "nba": "sports", "nfl": "sports", "mlb": "sports",
+    "nhl": "sports", "soccer": "sports", "epl": "sports", "ufc": "sports",
+    "mma": "sports", "tennis": "sports", "golf": "sports", "esports": "sports",
+    "olympics": "sports", "formula-1": "sports", "cricket": "sports",
+    "economy": "economy", "fed": "economy", "macro": "economy", "finance": "economy",
+    "business": "economy", "economics": "economy",
+}
 
-      - name: Save checkpoint + data
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: data
-          key: poly-data-${{ github.run_id }}
+CATEGORY_KEYWORDS = {
+    "crypto": ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crypto",
+               "doge", "dogecoin", "xrp", "memecoin", "altcoin"],
+    "politics": ["election", "president", "senate", "congress", "trump", "biden",
+                 "parliament", "minister", "vote", "poll", "ceasefire", "impeach"],
+    "sports": ["nba", "nfl", "mlb", "nhl", "ufc", "premier league", "champions league",
+               "world cup", "super bowl", "grand slam", "wimbledon", "goalscorer",
+               "playoffs", "draft"],
+    "economy": ["fed", "rate hike", "rate cut", "inflation", "cpi", "gdp",
+                "recession", "jobs report", "tariff"],
+}
+_WORD_RES = {cat: [_re.compile(r"\b" + _re.escape(w) + r"\b") for w in words]
+             for cat, words in CATEGORY_KEYWORDS.items()}
 
-      - name: Publish to R2
-        if: always()
-        env:
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
-          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
-        run: |
-          if [ -z "$R2_ACCOUNT_ID" ]; then
-            echo "R2-secrets ikke satt — hopper over publisering."; exit 0
-          fi
-          if [ ! -d data/publish ]; then
-            echo "Ingen publish-mappe denne kjoringen."; exit 0
-          fi
-          pip install --quiet awscli
-          aws s3 sync data/publish "s3://hindsight-data/" \
-            --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-          echo "Publisert til R2."
 
-      - name: Upload data as artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: polymarket-data
-          path: data/
-          retention-days: 30
+def tag_labels(market: dict):
+    out = []
+    for t in (market.get("tags") or []):
+        label = t.get("slug") or t.get("label") if isinstance(t, dict) else str(t)
+        if label:
+            out.append(str(label).lower())
+    return out
+
+
+def categorize(market: dict) -> str:
+    for label in tag_labels(market):
+        if label in TAG_MAP:
+            return TAG_MAP[label]
+    text = str(market.get("question", "")).lower()
+    for cat, regexes in _WORD_RES.items():
+        if any(r.search(text) for r in regexes):
+            return cat
+    return "other"
+
+
+def get_json(url, params=None, attempts=5):
+    for attempt in range(1, attempts + 1):
+        try:
+            r = SESSION.get(url, params=params, timeout=30)
+        except requests.RequestException as e:
+            print(f"  ! nettverksfeil ({attempt}/{attempts}): {e}", flush=True)
+            time.sleep(min(2 ** attempt, 60))
+            continue
+        if r.status_code == 200:
+            try:
+                return r.json()
+            except ValueError:
+                print(f"  ! ugyldig JSON: {r.text[:200]}", flush=True)
+        elif r.status_code == 429:
+            wait = int(r.headers.get("Retry-After", 0)) or min(10 * attempt, 120)
+            print(f"  ! rate limit, venter {wait}s", flush=True)
+            time.sleep(wait)
+            continue
+        else:
+            print(f"  ! HTTP {r.status_code} params={params}: {r.text[:200]}", flush=True)
+        time.sleep(min(2 ** attempt, 60))
+    return None
+
+
+def parse_market(m):
+    token_ids = m.get("clobTokenIds")
+    if isinstance(token_ids, str):
+        try:
+            token_ids = json.loads(token_ids)
+        except json.JSONDecodeError:
+            token_ids = []
+    outcomes = m.get("outcomes")
+    if isinstance(outcomes, str):
+        try:
+            outcomes = json.loads(outcomes)
+        except json.JSONDecodeError:
+            outcomes = []
+    return {
+        "market_id": str(m.get("id")),
+        "tags": json.dumps(tag_labels(m)),
+        "condition_id": m.get("conditionId"),
+        "question": m.get("question"),
+        "category": categorize(m),
+        "outcomes": json.dumps(outcomes),
+        "token_ids": json.dumps(token_ids or []),
+        "start_date": m.get("startDate"),
+        "end_date": m.get("endDate"),
+        "volume": float(m.get("volumeNum") or m.get("volume") or 0),
+        "liquidity": float(m.get("liquidityNum") or m.get("liquidity") or 0),
+        "resolved_outcome": m.get("outcomePrices"),
+    }
+
+
+def month_windows(start_year=2020):
+    """(fra, til)-par per maaned frem til i dag."""
+    windows = []
+    y, m = start_year, 1
+    today = date.today()
+    while (y, m) <= (today.year, today.month):
+        ny, nm = (y + 1, 1) if m == 12 else (y, m + 1)
+        windows.append((f"{y}-{m:02d}-01T00:00:00Z", f"{ny}-{nm:02d}-01T00:00:00Z"))
+        y, m = ny, nm
+    return windows
+
+
+def fetch_all_markets() -> pd.DataFrame:
+    rows = []
+    for start, end in month_windows():
+        offset, month_count = 0, 0
+        while True:
+            batch = get_json(f"{GAMMA}/markets", {
+                "closed": "true", "limit": 500, "offset": offset,
+                "end_date_min": start, "end_date_max": end,
+            }, attempts=4)
+            if batch is None:
+                print(f"  !! hopper over resten av vindu {start[:7]} ved offset {offset}", flush=True)
+                break
+            if not batch:
+                break
+            rows.extend(parse_market(m) for m in batch)
+            month_count += len(batch)
+            offset += len(batch)
+            time.sleep(0.4)
+        print(f"  {start[:7]}: {month_count} markeder (totalt {len(rows)})", flush=True)
+    df = pd.DataFrame(rows).drop_duplicates(subset="market_id")
+    return df
+
+
+def fetch_price_history(token_id, fidelity):
+    data = get_json(f"{CLOB}/prices-history", {
+        "market": token_id, "interval": "max", "fidelity": fidelity,
+    }, attempts=3)
+    if not data:
+        return None
+    hist = data.get("history") or []
+    if not hist:
+        return None
+    df = pd.DataFrame(hist)
+    df["t"] = pd.to_datetime(df["t"], unit="s", utc=True)
+    return df.rename(columns={"t": "timestamp", "p": "price"})
+
+
+def load_checkpoint():
+    if CHECKPOINT.exists():
+        return set(json.loads(CHECKPOINT.read_text()))
+    return set()
+
+
+def save_checkpoint(done):
+    CHECKPOINT.write_text(json.dumps(sorted(done)))
+
+
+def load_nohistory():
+    if NOHISTORY.exists():
+        return set(json.loads(NOHISTORY.read_text()))
+    return set()
+
+
+def save_nohistory(nohist):
+    NOHISTORY.write_text(json.dumps(sorted(nohist)))
+
+
+def publish(markets):
+    """Slaa sammen prisfiler per kategori og legg alt klart for opplasting."""
+    pub = DATA_DIR / "publish"
+    pub.mkdir(exist_ok=True)
+    manifest = {"updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "categories": {}}
+    for catdir in sorted(p for p in PRICES_DIR.iterdir() if p.is_dir()):
+        frames = []
+        for f in catdir.glob("*.parquet"):
+            df = pd.read_parquet(f)
+            df["market_id"] = f.stem
+            frames.append(df)
+        if not frames:
+            continue
+        big = pd.concat(frames, ignore_index=True)
+        out = pub / f"prices-{catdir.name}.parquet"
+        big.to_parquet(out, index=False)
+        manifest["categories"][catdir.name] = {
+            "markets": len(frames), "rows": int(len(big)),
+            "bytes": out.stat().st_size,
+        }
+    markets.to_parquet(pub / "markets.parquet", index=False)
+    (pub / "manifest.json").write_text(json.dumps(manifest))
+    print(f"Publisert {len(manifest['categories'])} kategorier til data/publish/", flush=True)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--fidelity", type=int, default=60)
+    ap.add_argument("--category", default=None)
+    ap.add_argument("--min-volume", type=float, default=0)
+    ap.add_argument("--since", default=None,
+                    help="Kun markeder avsluttet etter denne datoen, f.eks. 2024-01-01")
+    ap.add_argument("--max-seconds", type=int, default=18900,
+                    help="Avslutt pent etter saa mange sekunder (default 5t15m)")
+    args = ap.parse_args()
+    t0 = time.monotonic()
+
+    DATA_DIR.mkdir(exist_ok=True)
+    PRICES_DIR.mkdir(exist_ok=True)
+
+    markets_path = DATA_DIR / "markets.parquet"
+    meta_ok = False
+    if markets_path.exists() and META_DONE.exists():
+        markets = pd.read_parquet(markets_path)
+        if "tags" in markets.columns:
+            meta_ok = True
+            print(f"Bruker komplett metadata: {len(markets)} markeder")
+        else:
+            print("Metadata mangler tags (gammel versjon) — henter paa nytt for riktig kategorisering.")
+    if meta_ok:
+        # Inkrementell oppdatering: refetch siste 60 dager (nye markeder + endelige utfall)
+        cutoff = (date.today() - timedelta(days=60)).isoformat() + "T00:00:00Z"
+        fresh, offset = [], 0
+        while True:
+            batch = get_json(f"{GAMMA}/markets", {
+                "closed": "true", "limit": 500, "offset": offset,
+                "end_date_min": cutoff,
+            }, attempts=4)
+            if not batch:
+                break
+            fresh.extend(parse_market(x) for x in batch)
+            offset += len(batch)
+            time.sleep(0.4)
+        if fresh:
+            fresh_df = pd.DataFrame(fresh).drop_duplicates(subset="market_id")
+            n_new = len(set(fresh_df["market_id"]) - set(markets["market_id"]))
+            markets = pd.concat([
+                markets[~markets["market_id"].isin(fresh_df["market_id"])],
+                fresh_df,
+            ], ignore_index=True)
+            markets.to_parquet(markets_path, index=False)
+            print(f"Metadata oppdatert: {len(fresh_df)} markeder refetchet, {n_new} nye. Totalt {len(markets)}.")
+    if not meta_ok:
+        if markets_path.exists():
+            print("Fant ufullstendig metadata fra tidligere kjoring — henter paa nytt.")
+        print("Henter alle markeder (maaned for maaned) ...")
+        markets = fetch_all_markets()
+        if markets.empty:
+            raise SystemExit("Fikk ingen markeder — se loggen for HTTP-feil.")
+        markets.to_parquet(markets_path, index=False)
+        META_DONE.write_text("ok")
+        print(f"Lagret {len(markets)} markeder -> {markets_path}")
+
+    # Rydd: flytt prisfiler som ligger i feil kategorimappe
+    cat_by_id = dict(zip(markets["market_id"].astype(str), markets["category"]))
+    moved = 0
+    if PRICES_DIR.exists():
+        for f in PRICES_DIR.glob("*/*.parquet"):
+            correct = cat_by_id.get(f.stem)
+            if correct and f.parent.name != correct:
+                dest = PRICES_DIR / correct
+                dest.mkdir(exist_ok=True)
+                f.rename(dest / f.name)
+                moved += 1
+    if moved:
+        print(f"Flyttet {moved} prisfiler til riktig kategorimappe.")
+
+    sel = markets
+    if args.since:
+        sel = sel[sel["end_date"].fillna("") >= args.since]
+    if args.category:
+        sel = sel[sel["category"] == args.category]
+    if args.min_volume > 0:
+        dur_min = (pd.to_datetime(sel["end_date"], errors="coerce", utc=True)
+                   - pd.to_datetime(sel["start_date"], errors="coerce", utc=True)
+                   ).dt.total_seconds() / 60
+        short = dur_min.notna() & (dur_min <= 300)  # <= 5 timer (5m/15m/1h/4h-markeder)
+        sel = sel[(sel["volume"] >= args.min_volume) | (short & (sel["volume"] >= 50))]
+    sel = sel[sel["token_ids"] != "[]"]
+    print(f"Henter prishistorikk for {len(sel)} markeder (fidelity={args.fidelity}m)")
+
+    on_disk = {f.stem for f in PRICES_DIR.glob("*/*.parquet")}
+    nohist = load_nohistory()
+    old_done = load_checkpoint()
+    done = on_disk | nohist
+    lost = len(old_done - done)
+    print(f"Verifisert checkpoint: {len(on_disk)} filer paa disk, "
+          f"{len(nohist)} bekreftet uten historikk"
+          + (f", {lost} tidligere 'ferdige' uten fil — proves paa nytt" if lost else ""),
+          flush=True)
+    save_checkpoint(done)
+
+    def stop_cleanly():
+        save_checkpoint(done)
+        save_nohistory(nohist)
+        publish(markets)
+        print(f"Tidsbudsjett naadd — lagrer og avslutter pent. "
+              f"({len(done)}/{len(sel)} avklart, {len(nohist)} uten historikk totalt)", flush=True)
+
+    for i, (_, m) in enumerate(sel.iterrows(), 1):
+        if time.monotonic() - t0 > args.max_seconds:
+            stop_cleanly()
+            return
+        mid = str(m["market_id"])
+        if mid in done:
+            continue
+        frames = []
+        used_fallback = False
+        for j, tok in enumerate(json.loads(m["token_ids"])):
+            df = fetch_price_history(tok, args.fidelity)
+            if df is None and args.fidelity > 1:
+                df = fetch_price_history(tok, 1)   # kortlivet marked? prov minuttdata
+                if df is not None:
+                    used_fallback = True
+            if df is not None:
+                df["outcome_index"] = j
+                frames.append(df)
+            time.sleep(0.25)
+        if frames:
+            out_dir = PRICES_DIR / m["category"]
+            out_dir.mkdir(exist_ok=True)
+            if used_fallback:
+                for fr in frames:
+                    fr["fidelity_min"] = 1
+            pd.concat(frames).to_parquet(out_dir / f"{mid}.parquet", index=False)
+        else:
+            nohist.add(mid)
+        done.add(mid)
+        if i % 50 == 0:
+            save_checkpoint(done)
+            save_nohistory(nohist)
+            print(f"  {i}/{len(sel)} ferdig ({len(nohist)} uten historikk)", flush=True)
+    save_checkpoint(done)
+    save_nohistory(nohist)
+    publish(markets)
+    print(f"Ferdig. {len(nohist)} markeder manglet CLOB-historikk.")
+
+
+if __name__ == "__main__":
+    main()
