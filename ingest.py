@@ -7,7 +7,7 @@ og hopper over markeder uten CLOB-historikk med tydelig logging.
 import argparse
 import json
 import time
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -221,6 +221,29 @@ def main():
             print(f"Bruker komplett metadata: {len(markets)} markeder")
         else:
             print("Metadata mangler tags (gammel versjon) — henter paa nytt for riktig kategorisering.")
+    if meta_ok:
+        # Inkrementell oppdatering: refetch siste 60 dager (nye markeder + endelige utfall)
+        cutoff = (date.today() - timedelta(days=60)).isoformat() + "T00:00:00Z"
+        fresh, offset = [], 0
+        while True:
+            batch = get_json(f"{GAMMA}/markets", {
+                "closed": "true", "limit": 500, "offset": offset,
+                "end_date_min": cutoff,
+            }, attempts=4)
+            if not batch:
+                break
+            fresh.extend(parse_market(x) for x in batch)
+            offset += len(batch)
+            time.sleep(0.4)
+        if fresh:
+            fresh_df = pd.DataFrame(fresh).drop_duplicates(subset="market_id")
+            n_new = len(set(fresh_df["market_id"]) - set(markets["market_id"]))
+            markets = pd.concat([
+                markets[~markets["market_id"].isin(fresh_df["market_id"])],
+                fresh_df,
+            ], ignore_index=True)
+            markets.to_parquet(markets_path, index=False)
+            print(f"Metadata oppdatert: {len(fresh_df)} markeder refetchet, {n_new} nye. Totalt {len(markets)}.")
     if not meta_ok:
         if markets_path.exists():
             print("Fant ufullstendig metadata fra tidligere kjoring — henter paa nytt.")
