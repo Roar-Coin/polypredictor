@@ -230,6 +230,10 @@ def main():
     ap.add_argument("--min-volume", type=float, default=0)
     ap.add_argument("--since", default=None,
                     help="Kun markeder avsluttet etter denne datoen, f.eks. 2024-01-01")
+    ap.add_argument("--since-days", type=int, default=180,
+                    help="Brukes hvis --since ikke er satt: hent kun markeder avsluttet "
+                         "de siste N dagene (eldre historikk er permanent slettet av API-et). "
+                         "0 = ingen grense.")
     ap.add_argument("--max-seconds", type=int, default=18900,
                     help="Avslutt pent etter saa mange sekunder (default 5t15m)")
     args = ap.parse_args()
@@ -296,8 +300,15 @@ def main():
         print(f"Flyttet {moved} prisfiler til riktig kategorimappe.")
 
     sel = markets
-    if args.since:
-        sel = sel[sel["end_date"].fillna("") >= args.since]
+    since = args.since
+    if not since and args.since_days > 0:
+        since = (date.today() - timedelta(days=args.since_days)).isoformat()
+    if since:
+        before = len(sel)
+        sel = sel[sel["end_date"].fillna("") >= since]
+        print(f"Tidsfilter: {len(sel)} av {before} markeder avsluttet etter {since[:10]} "
+              f"(eldre historikk finnes ikke i API-et)")
+    sel = sel.sort_values("end_date", ascending=False, na_position="last")
     if args.category:
         sel = sel[sel["category"] == args.category]
     if args.min_volume > 0:
