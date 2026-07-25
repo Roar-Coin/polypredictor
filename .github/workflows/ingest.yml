@@ -4,6 +4,8 @@
 name: polymarket-ingest
 
 on:
+  schedule:
+    - cron: "17 4 * * *"   # hver natt 04:17 UTC — fanger data foer den prunes
   workflow_dispatch:
     inputs:
       fidelity:
