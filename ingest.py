@@ -7,7 +7,7 @@ og hopper over markeder uten CLOB-historikk med tydelig logging.
 import argparse
 import json
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -140,25 +140,56 @@ def month_windows(start_year=2020):
     return windows
 
 
+OFFSET_LIMIT = 2000     # Gamma nekter dypere paginering enn dette
+
+
+def _parse_iso(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def _iso(dt):
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def fetch_window(start, end, depth=0):
+    """Hent alle markeder som avsluttes i [start, end). Deler vinduet i to hvis
+    offset-grensen treffes, saa ingen markeder gaar tapt."""
+    rows, offset, hit_limit = [], 0, False
+    while True:
+        if offset >= OFFSET_LIMIT:
+            hit_limit = True
+            break
+        batch = get_json(f"{GAMMA}/markets", {
+            "closed": "true", "limit": 500, "offset": offset,
+            "end_date_min": start, "end_date_max": end,
+        }, attempts=4)
+        if batch is None:
+            print(f"  !! {start[:10]}–{end[:10]}: gir opp ved offset {offset}", flush=True)
+            break
+        if not batch:
+            break
+        rows.extend(parse_market(m) for m in batch)
+        offset += len(batch)
+        time.sleep(0.35)
+
+    if hit_limit:
+        a, b = _parse_iso(start), _parse_iso(end)
+        if depth >= 8 or (b - a) <= timedelta(hours=1):
+            print(f"  !! {start[:10]}–{end[:10]}: kan ikke deles finere, "
+                  f"noen markeder kan mangle", flush=True)
+            return rows
+        mid = a + (b - a) / 2
+        print(f"  · {start[:10]}–{end[:10]} traff offset-grensen — deler vinduet", flush=True)
+        return fetch_window(start, _iso(mid), depth + 1) + fetch_window(_iso(mid), end, depth + 1)
+    return rows
+
+
 def fetch_all_markets() -> pd.DataFrame:
     rows = []
     for start, end in month_windows():
-        offset, month_count = 0, 0
-        while True:
-            batch = get_json(f"{GAMMA}/markets", {
-                "closed": "true", "limit": 500, "offset": offset,
-                "end_date_min": start, "end_date_max": end,
-            }, attempts=4)
-            if batch is None:
-                print(f"  !! hopper over resten av vindu {start[:7]} ved offset {offset}", flush=True)
-                break
-            if not batch:
-                break
-            rows.extend(parse_market(m) for m in batch)
-            month_count += len(batch)
-            offset += len(batch)
-            time.sleep(0.4)
-        print(f"  {start[:7]}: {month_count} markeder (totalt {len(rows)})", flush=True)
+        got = fetch_window(start, end)
+        rows.extend(got)
+        print(f"  {start[:7]}: {len(got)} markeder (totalt {len(rows)})", flush=True)
     df = pd.DataFrame(rows).drop_duplicates(subset="market_id")
     return df
 
@@ -254,17 +285,8 @@ def main():
     if meta_ok:
         # Inkrementell oppdatering: refetch siste 60 dager (nye markeder + endelige utfall)
         cutoff = (date.today() - timedelta(days=60)).isoformat() + "T00:00:00Z"
-        fresh, offset = [], 0
-        while True:
-            batch = get_json(f"{GAMMA}/markets", {
-                "closed": "true", "limit": 500, "offset": offset,
-                "end_date_min": cutoff,
-            }, attempts=4)
-            if not batch:
-                break
-            fresh.extend(parse_market(x) for x in batch)
-            offset += len(batch)
-            time.sleep(0.4)
+        horizon = (date.today() + timedelta(days=2)).isoformat() + "T00:00:00Z"
+        fresh = fetch_window(cutoff, horizon)
         if fresh:
             fresh_df = pd.DataFrame(fresh).drop_duplicates(subset="market_id")
             n_new = len(set(fresh_df["market_id"]) - set(markets["market_id"]))
