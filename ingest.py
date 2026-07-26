@@ -228,12 +228,22 @@ def save_nohistory(nohist):
     NOHISTORY.write_text(json.dumps(sorted(nohist)))
 
 
+EPOCH0 = pd.Timestamp("1970-01-01", tz="UTC")
+
+
+def to_epoch(series):
+    """ISO-tekst eller tidsstempel -> sekunder siden 1970 (float, NaN hvis ugyldig).
+    Nettleseren regner da kun med tall — ingen tidssone-funksjoner kreves."""
+    d = pd.to_datetime(series, utc=True, errors="coerce")
+    return (d - EPOCH0).dt.total_seconds()
+
+
 def publish(markets):
     """Slaa sammen prisfiler per kategori og legg alt klart for opplasting."""
     pub = DATA_DIR / "publish"
     pub.mkdir(exist_ok=True)
     manifest = {"updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "categories": {}}
+                "categories": {}, "schema": 2}
     for catdir in sorted(p for p in PRICES_DIR.iterdir() if p.is_dir()):
         frames = []
         for f in catdir.glob("*.parquet"):
@@ -243,15 +253,20 @@ def publish(markets):
         if not frames:
             continue
         big = pd.concat(frames, ignore_index=True)
+        big["ts_epoch"] = to_epoch(big["timestamp"])
         out = pub / f"prices-{catdir.name}.parquet"
         big.to_parquet(out, index=False)
         manifest["categories"][catdir.name] = {
             "markets": len(frames), "rows": int(len(big)),
             "bytes": out.stat().st_size,
         }
-    markets.to_parquet(pub / "markets.parquet", index=False)
+    mk = markets.copy()
+    mk["start_epoch"] = to_epoch(mk["start_date"])
+    mk["end_epoch"] = to_epoch(mk["end_date"])
+    mk.to_parquet(pub / "markets.parquet", index=False)
     (pub / "manifest.json").write_text(json.dumps(manifest))
-    print(f"Publisert {len(manifest['categories'])} kategorier til data/publish/", flush=True)
+    print(f"Publisert {len(manifest['categories'])} kategorier til data/publish/ "
+          f"(schema 2 med epoch-kolonner)", flush=True)
 
 
 def main():
