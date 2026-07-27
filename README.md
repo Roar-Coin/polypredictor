@@ -1,5 +1,5 @@
-# Hindsight — statusdokument
-*Backtesting for Polymarket. Sist oppdatert 27. juli 2026.*
+# Hindsight 
+Backtesting for Polymarket — samler prishistorikk som API-et sletter
 
 ## Hva produktet er
 Nettside der brukeren tester handelsregler mot avsluttede Polymarket-markeder.
