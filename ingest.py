@@ -22,6 +22,8 @@ CHECKPOINT = DATA_DIR / "checkpoint.json"
 NOHISTORY = DATA_DIR / "nohistory.json"
 META_DONE = DATA_DIR / "meta_complete.flag"
 
+ERROR = object()   # skiller "API-et feilet" fra "API-et sa: ingen data"
+
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "poly-backtester-ingest/0.3"})
 
@@ -95,8 +97,12 @@ def get_json(url, params=None, attempts=5):
             continue
         else:
             print(f"  ! HTTP {r.status_code} params={params}: {r.text[:200]}", flush=True)
+            if 500 <= r.status_code < 600:
+                # serveren deres er overbelastet — vent lenger enn vanlig
+                time.sleep(min(15 * attempt, 90))
+                continue
         time.sleep(min(2 ** attempt, 60))
-    return None
+    return ERROR
 
 
 def parse_market(m):
@@ -163,7 +169,7 @@ def fetch_window(start, end, depth=0):
             "closed": "true", "limit": 500, "offset": offset,
             "end_date_min": start, "end_date_max": end,
         }, attempts=4)
-        if batch is None:
+        if batch is ERROR:
             print(f"  !! {start[:10]}–{end[:10]}: gir opp ved offset {offset}", flush=True)
             break
         if not batch:
@@ -195,9 +201,12 @@ def fetch_all_markets() -> pd.DataFrame:
 
 
 def fetch_price_history(token_id, fidelity):
+    """DataFrame = data, None = bekreftet ingen historikk, ERROR = kallet feilet."""
     data = get_json(f"{CLOB}/prices-history", {
         "market": token_id, "interval": "max", "fidelity": fidelity,
     }, attempts=3)
+    if data is ERROR:
+        return ERROR
     if not data:
         return None
     hist = data.get("history") or []
@@ -372,6 +381,8 @@ def main():
     old_done = load_checkpoint()
     done = on_disk | nohist
     on_disk_new = set()
+    err_skipped = 0
+    consec_err = 0
     lost = len(old_done - done)
     print(f"Verifisert checkpoint: {len(on_disk)} filer paa disk, "
           f"{len(nohist)} bekreftet uten historikk"
@@ -386,7 +397,8 @@ def main():
         save_nohistory(nohist)
         publish(markets)
         print(f"Tidsbudsjett naadd — lagrer og avslutter pent. "
-              f"({len(done)}/{len(sel)} avklart, {len(nohist)} uten historikk totalt)", flush=True)
+              f"({len(done)}/{len(sel)} avklart, {len(nohist)} uten historikk totalt"
+              + (f", {err_skipped} utsatt pga. serverfeil" if err_skipped else "") + ")", flush=True)
 
     for i, (_, m) in enumerate(sel.iterrows(), 1):
         if time.monotonic() - t0 > args.max_seconds:
@@ -397,19 +409,25 @@ def main():
             continue
         frames = []
         used_fallback = False
+        had_error = False
         # Minuttdata er bare relevant for markeder som er for korte til aa gi timesbarer.
         # Aa prove det paa alle doblet antall API-kall uten aa gi ny data.
         is_short = bool(pd.notna(m["_dur_min"]) and m["_dur_min"] <= 300)
         for j, tok in enumerate(json.loads(m["token_ids"])):
             df = fetch_price_history(tok, args.fidelity)
-            if df is None and is_short and args.fidelity > 1:
+            if df is ERROR:
+                had_error = True
+            elif df is None and is_short and args.fidelity > 1:
                 df = fetch_price_history(tok, 1)
-                if df is not None:
+                if df is ERROR:
+                    had_error = True
+                elif df is not None:
                     used_fallback = True
-            if df is not None:
+            if df is not None and df is not ERROR:
                 df["outcome_index"] = j
                 frames.append(df)
             time.sleep(0.12)
+
         if frames:
             out_dir = PRICES_DIR / m["category"]
             out_dir.mkdir(exist_ok=True)
@@ -418,18 +436,34 @@ def main():
                     fr["fidelity_min"] = 1
             pd.concat(frames).to_parquet(out_dir / f"{mid}.parquet", index=False)
             on_disk_new.add(mid)
+            done.add(mid)
+            consec_err = 0
+        elif had_error:
+            # VIKTIG: ikke marker som avklart. Serverfeil != ingen historikk.
+            # Markedet provers paa nytt neste kjoring, saa data ikke gaar tapt.
+            err_skipped += 1
+            consec_err += 1
+            if consec_err >= 5:
+                print("  ! API-et svarer med serverfeil — pauser 60s", flush=True)
+                time.sleep(60)
+                consec_err = 0
         else:
             nohist.add(mid)
-        done.add(mid)
+            done.add(mid)
+            consec_err = 0
         if i % 50 == 0:
             save_checkpoint(done)
             save_nohistory(nohist)
             print(f"  {i}/{len(sel)} sjekket · {len(on_disk_new)} nye prisfiler "
-                  f"· {len(nohist)} uten historikk", flush=True)
+                  f"· {len(nohist)} uten historikk"
+                  + (f" · {err_skipped} utsatt pga. serverfeil" if err_skipped else ""),
+                  flush=True)
     save_checkpoint(done)
     save_nohistory(nohist)
     publish(markets)
-    print(f"Ferdig. {len(nohist)} markeder manglet CLOB-historikk.")
+    print(f"Ferdig. {len(nohist)} markeder manglet CLOB-historikk."
+          + (f" {err_skipped} markeder ble utsatt pga. serverfeil og provers neste kjoring."
+             if err_skipped else ""))
 
 
 if __name__ == "__main__":
