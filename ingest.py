@@ -274,6 +274,9 @@ def main():
     ap.add_argument("--fidelity", type=int, default=60)
     ap.add_argument("--category", default=None)
     ap.add_argument("--min-volume", type=float, default=0)
+    ap.add_argument("--short-min-volume", type=float, default=200,
+                    help="Volumgulv for kortlivede markeder (<=5t). Polymarket lager "
+                         "tusenvis av smaa 5-minuttersmarkeder; de fleste har ingen handler.")
     ap.add_argument("--since", default=None,
                     help="Kun markeder avsluttet etter denne datoen, f.eks. 2024-01-01")
     ap.add_argument("--since-days", type=int, default=180,
@@ -345,7 +348,13 @@ def main():
         sel = sel[sel["end_date"].fillna("") >= since]
         print(f"Tidsfilter: {len(sel)} av {before} markeder avsluttet etter {since[:10]} "
               f"(eldre historikk finnes ikke i API-et)")
-    sel = sel.sort_values("end_date", ascending=False, na_position="last")
+    # Varighet i minutter — brukes til aa avgjore om minutt-fallback er meningsfullt
+    sel = sel.copy()
+    sel["_dur_min"] = (pd.to_datetime(sel["end_date"], errors="coerce", utc=True)
+                       - pd.to_datetime(sel["start_date"], errors="coerce", utc=True)
+                       ).dt.total_seconds() / 60
+    # Mest verdifulle markeder forst, saa et avbrutt lop aldri mister det som betyr noe
+    sel = sel.sort_values("volume", ascending=False, na_position="last")
     if args.category:
         sel = sel[sel["category"] == args.category]
     if args.min_volume > 0:
@@ -353,7 +362,8 @@ def main():
                    - pd.to_datetime(sel["start_date"], errors="coerce", utc=True)
                    ).dt.total_seconds() / 60
         short = dur_min.notna() & (dur_min <= 300)  # <= 5 timer (5m/15m/1h/4h-markeder)
-        sel = sel[(sel["volume"] >= args.min_volume) | (short & (sel["volume"] >= 50))]
+        sel = sel[(sel["volume"] >= args.min_volume)
+                  | (short & (sel["volume"] >= args.short_min_volume))]
     sel = sel[sel["token_ids"] != "[]"]
     print(f"Henter prishistorikk for {len(sel)} markeder (fidelity={args.fidelity}m)")
 
@@ -361,12 +371,15 @@ def main():
     nohist = load_nohistory()
     old_done = load_checkpoint()
     done = on_disk | nohist
+    on_disk_new = set()
     lost = len(old_done - done)
     print(f"Verifisert checkpoint: {len(on_disk)} filer paa disk, "
           f"{len(nohist)} bekreftet uten historikk"
           + (f", {lost} tidligere 'ferdige' uten fil — proves paa nytt" if lost else ""),
           flush=True)
     save_checkpoint(done)
+    pending = sum(1 for x in sel["market_id"].astype(str) if x not in done)
+    print(f"Koe: {pending} av {len(sel)} markeder i vinduet gjenstaar aa sjekke", flush=True)
 
     def stop_cleanly():
         save_checkpoint(done)
@@ -384,16 +397,19 @@ def main():
             continue
         frames = []
         used_fallback = False
+        # Minuttdata er bare relevant for markeder som er for korte til aa gi timesbarer.
+        # Aa prove det paa alle doblet antall API-kall uten aa gi ny data.
+        is_short = bool(pd.notna(m["_dur_min"]) and m["_dur_min"] <= 300)
         for j, tok in enumerate(json.loads(m["token_ids"])):
             df = fetch_price_history(tok, args.fidelity)
-            if df is None and args.fidelity > 1:
-                df = fetch_price_history(tok, 1)   # kortlivet marked? prov minuttdata
+            if df is None and is_short and args.fidelity > 1:
+                df = fetch_price_history(tok, 1)
                 if df is not None:
                     used_fallback = True
             if df is not None:
                 df["outcome_index"] = j
                 frames.append(df)
-            time.sleep(0.25)
+            time.sleep(0.12)
         if frames:
             out_dir = PRICES_DIR / m["category"]
             out_dir.mkdir(exist_ok=True)
@@ -401,13 +417,15 @@ def main():
                 for fr in frames:
                     fr["fidelity_min"] = 1
             pd.concat(frames).to_parquet(out_dir / f"{mid}.parquet", index=False)
+            on_disk_new.add(mid)
         else:
             nohist.add(mid)
         done.add(mid)
         if i % 50 == 0:
             save_checkpoint(done)
             save_nohistory(nohist)
-            print(f"  {i}/{len(sel)} ferdig ({len(nohist)} uten historikk)", flush=True)
+            print(f"  {i}/{len(sel)} sjekket · {len(on_disk_new)} nye prisfiler "
+                  f"· {len(nohist)} uten historikk", flush=True)
     save_checkpoint(done)
     save_nohistory(nohist)
     publish(markets)
