@@ -29,32 +29,81 @@ SESSION.headers.update({"User-Agent": "poly-backtester-ingest/0.3"})
 
 import re as _re
 
+# Gamma returnerer tags kun naar ?include_tag=true sendes med. Uten den var
+# hele dette kartet doed kode og alt ble kategorisert paa nokkelord alene.
+#
+# Rekkefolgen i PRIORITY avgjor — IKKE rekkefolgen Polymarket sender taggene i.
+# Et CS2-marked er tagget baade "sports" og "esports"; uten prioritet ville det
+# havnet i sport sammen med Wimbledon.
+PRIORITY = ["crypto", "esports", "weather", "stocks",
+            "sports", "politics", "economy", "culture"]
+
 TAG_MAP = {
-    "crypto": "crypto", "bitcoin": "crypto", "ethereum": "crypto", "solana": "crypto",
-    "memecoins": "crypto", "stablecoins": "crypto", "defi": "crypto", "nft": "crypto",
-    "politics": "politics", "elections": "politics", "geopolitics": "politics",
-    "us-current-affairs": "politics", "world": "politics", "trump": "politics",
-    "sports": "sports", "nba": "sports", "nfl": "sports", "mlb": "sports",
-    "nhl": "sports", "soccer": "sports", "epl": "sports", "ufc": "sports",
-    "mma": "sports", "tennis": "sports", "golf": "sports", "esports": "sports",
-    "olympics": "sports", "formula-1": "sports", "cricket": "sports",
-    "economy": "economy", "fed": "economy", "macro": "economy", "finance": "economy",
-    "business": "economy", "economics": "economy",
+    "crypto": {
+        "crypto", "crypto-prices", "bitcoin", "ethereum", "solana", "memecoins",
+        "stablecoins", "defi", "nft", "altcoins", "xrp", "dogecoin", "bnb",
+        "cardano", "chainlink", "avalanche", "litecoin", "pepe", "shiba-inu",
+        "crypto-etf", "hourly-crypto",
+    },
+    "esports": {
+        "esports", "counter-strike-2", "counter-strike", "cs2", "league-of-legends",
+        "dota-2", "valorant", "call-of-duty", "rocket-league", "overwatch",
+        "starcraft", "apex-legends",
+    },
+    "weather": {"weather", "climate", "temperature", "hurricane", "hurricanes"},
+    "stocks": {
+        "stocks", "earnings", "equities", "ipo", "etf", "nasdaq", "sp500",
+        "companies", "tech-stocks",
+    },
+    "sports": {
+        "sports", "nba", "nfl", "mlb", "nhl", "soccer", "epl", "ufc", "mma",
+        "tennis", "golf", "olympics", "formula-1", "cricket", "basketball",
+        "baseball", "football", "hockey", "boxing", "atp", "wta", "itf",
+        "champions-league", "europa-league", "fifa-world-cup", "wnba", "ncaa",
+        "college-football", "college-basketball", "rugby", "cycling", "chess",
+        "major-league-cricket", "nba-playoffs", "nba-finals", "wc-tournament-futures",
+    },
+    "politics": {
+        "politics", "elections", "geopolitics", "us-current-affairs", "world",
+        "trump", "foreign-affairs", "international-affairs", "house-races",
+        "us-elections", "democratic-party", "republican-party", "legal-cases",
+        "senate-races", "governor-races",
+    },
+    "economy": {
+        "economy", "fed", "macro", "finance", "business", "economics",
+        "macro-graph", "macro-single", "inflation", "fdic", "tariffs",
+    },
+    "culture": {
+        "pop-culture", "movies", "music", "awards", "oscars", "entertainment",
+        "tv", "celebrities", "openai", "ai", "science", "space",
+    },
 }
 
+# Tags som ikke sier noe om emne — de skal aldri styre kategorien.
+NOISE_TAGS = {"all", "recurring", "hide-from-new", "multi-strikes", "games",
+              "1h", "1d", "weekly", "monthly", "daily", "featured", "new"}
+
+# Nokkelord er naa bare et sikkerhetsnett for markeder uten brukbare tags.
 CATEGORY_KEYWORDS = {
     "crypto": ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crypto",
-               "doge", "dogecoin", "xrp", "memecoin", "altcoin"],
+               "doge", "dogecoin", "xrp", "memecoin", "altcoin", "bnb", "cardano",
+               "ada", "chainlink", "avax", "litecoin", "pepe"],
+    "weather": ["highest temperature", "lowest temperature", "rainfall",
+                "snowfall", "hurricane"],
+    "stocks": ["up or down on", "beat quarterly earnings", "market cap",
+               "finish week of", "ipo day"],
     "politics": ["election", "president", "senate", "congress", "trump", "biden",
                  "parliament", "minister", "vote", "poll", "ceasefire", "impeach"],
     "sports": ["nba", "nfl", "mlb", "nhl", "ufc", "premier league", "champions league",
                "world cup", "super bowl", "grand slam", "wimbledon", "goalscorer",
-               "playoffs", "draft"],
+               "playoffs", "draft", "itf", "o/u", "spread", "handicap", "exact score",
+               "set 1 winner", "set 2 winner", "set 3 winner"],
     "economy": ["fed", "rate hike", "rate cut", "inflation", "cpi", "gdp",
                 "recession", "jobs report", "tariff"],
 }
 _WORD_RES = {cat: [_re.compile(r"\b" + _re.escape(w) + r"\b") for w in words]
              for cat, words in CATEGORY_KEYWORDS.items()}
+_TAG_TO_CAT = {slug: cat for cat, slugs in TAG_MAP.items() for slug in slugs}
 
 
 def tag_labels(market: dict):
@@ -63,17 +112,28 @@ def tag_labels(market: dict):
         label = t.get("slug") or t.get("label") if isinstance(t, dict) else str(t)
         if label:
             out.append(str(label).lower())
+    # Gamma legger av og til taggene paa event-objektet i stedet
+    if not out:
+        for ev in (market.get("events") or []):
+            for t in (ev.get("tags") or []):
+                label = t.get("slug") or t.get("label") if isinstance(t, dict) else str(t)
+                if label:
+                    out.append(str(label).lower())
     return out
 
 
 def categorize(market: dict) -> str:
-    for label in tag_labels(market):
-        if label in TAG_MAP:
-            return TAG_MAP[label]
+    hits = {_TAG_TO_CAT[l] for l in tag_labels(market)
+            if l not in NOISE_TAGS and l in _TAG_TO_CAT}
+    if hits:
+        for cat in PRIORITY:          # var: forste tag Polymarket tilfeldigvis sendte
+            if cat in hits:
+                return cat
     text = str(market.get("question", "")).lower()
-    for cat, regexes in _WORD_RES.items():
-        if any(r.search(text) for r in regexes):
-            return cat
+    for cat in PRIORITY:
+        for r in _WORD_RES.get(cat, []):
+            if r.search(text):
+                return cat
     return "other"
 
 
@@ -168,6 +228,7 @@ def fetch_window(start, end, depth=0):
         batch = get_json(f"{GAMMA}/markets", {
             "closed": "true", "limit": 500, "offset": offset,
             "end_date_min": start, "end_date_max": end,
+            "include_tag": "true",
         }, attempts=4)
         if batch is ERROR:
             print(f"  !! {start[:10]}–{end[:10]}: gir opp ved offset {offset}", flush=True)
@@ -304,11 +365,18 @@ def main():
     meta_ok = False
     if markets_path.exists() and META_DONE.exists():
         markets = pd.read_parquet(markets_path)
-        if "tags" in markets.columns:
+        # Kolonnen "tags" fantes ogsaa for include_tag=true — den var bare full av
+        # tomme lister. Sjekk innholdet, ikke bare at kolonnen er der, ellers ville
+        # den inkrementelle veien beholdt 687k feilkategoriserte rader for alltid.
+        filled = (markets["tags"].astype(str).str.len() > 2).mean() \
+            if "tags" in markets.columns else 0.0
+        if filled > 0.5:
             meta_ok = True
-            print(f"Bruker komplett metadata: {len(markets)} markeder")
+            print(f"Bruker komplett metadata: {len(markets)} markeder "
+                  f"({filled*100:.0f} % med tags)")
         else:
-            print("Metadata mangler tags (gammel versjon) — henter paa nytt for riktig kategorisering.")
+            print(f"Metadata har tags paa bare {filled*100:.1f} % av radene — "
+                  f"henter alt paa nytt med include_tag=true.")
     if meta_ok:
         # Inkrementell oppdatering: refetch siste 60 dager (nye markeder + endelige utfall)
         cutoff = (date.today() - timedelta(days=60)).isoformat() + "T00:00:00Z"
@@ -333,6 +401,28 @@ def main():
         markets.to_parquet(markets_path, index=False)
         META_DONE.write_text("ok")
         print(f"Lagret {len(markets)} markeder -> {markets_path}")
+
+    print("\n=== kategorifordeling ===")
+    for cat, n in markets["category"].value_counts().items():
+        print(f"  {cat:<10} {n:>7}  {n/len(markets)*100:5.1f} %")
+
+    # Tag-sensus over det som fortsatt er ukategorisert, vektet paa volum:
+    # grunnlaget for aa utvide TAG_MAP med bevis i stedet for gjetning.
+    rest = markets[(markets["category"] == "other") & (markets["volume"] >= 1000)]
+    if len(rest):
+        from collections import Counter
+        c = Counter()
+        for v in rest["tags"]:
+            try:
+                for t in (json.loads(v) if isinstance(v, str) else (v or [])):
+                    t = str(t).lower()
+                    if t not in NOISE_TAGS and t not in _TAG_TO_CAT:
+                        c[t] += 1
+            except (json.JSONDecodeError, TypeError):
+                pass
+        print(f"\n=== 30 vanligste ukjente tags i 'other' ({len(rest)} med volum) ===")
+        for slug, n in c.most_common(30):
+            print(f"  {slug:<34} {n:>6}")
 
     # Rydd: flytt prisfiler som ligger i feil kategorimappe
     cat_by_id = dict(zip(markets["market_id"].astype(str), markets["category"]))
