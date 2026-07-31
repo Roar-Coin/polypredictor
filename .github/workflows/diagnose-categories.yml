@@ -1,0 +1,37 @@
+# .github/workflows/diagnose.yml
+# Engangs-diagnose. Henter ned metadata fra R2 og leser den. Skriver ingenting tilbake.
+name: diagnose-categories
+
+on:
+  workflow_dispatch:
+
+env:
+  R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install --quiet pandas pyarrow requests awscli
+
+      - name: Fetch markets.parquet from R2
+        run: |
+          mkdir -p data
+          aws s3 cp "s3://hindsight-data/raw/markets.parquet" data/markets.parquet \
+            --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          ls -lh data/markets.parquet
+
+      - name: Diagnose
+        run: python diagnose_categories.py
