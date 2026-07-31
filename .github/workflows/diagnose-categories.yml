@@ -33,5 +33,5 @@ jobs:
             --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
           ls -lh data/markets.parquet
 
-      - name: Diagnose
-        run: python diagnose_categories.py
+      - name: Probe tags
+        run: python probe_tags.py
