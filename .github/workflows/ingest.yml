@@ -5,8 +5,7 @@
 name: polymarket-ingest
 
 on:
-  schedule:
-    - cron: "17 4 * * *"   # hver natt 04:17 UTC
+  
   workflow_dispatch:
     inputs:
       fidelity:
@@ -21,6 +20,10 @@ on:
       since_days:
         description: "Hent markeder avsluttet siste N dager (0 = alle)"
         default: "180"
+
+concurrency:
+  group: polymarket-ingest
+  cancel-in-progress: false
 
 env:
   R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
