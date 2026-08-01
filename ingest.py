@@ -251,14 +251,28 @@ def fetch_window(start, end, depth=0):
     return rows
 
 
-def fetch_all_markets() -> pd.DataFrame:
+def fetch_all_markets(since_iso=None, deadline=None, on_month=None) -> pd.DataFrame:
+    """since_iso: hopp over maaneder som slutter for dette. deadline: monotonic-frist.
+
+    Nyeste maaned forst, slik at en avbrutt kjoring likevel har hentet det som
+    betyr noe — CLOB har uansett slettet prishistorikken for eldre markeder.
+    """
     rows = []
-    for start, end in month_windows():
+    wins = list(month_windows())
+    if since_iso:
+        wins = [w for w in wins if w[1] >= since_iso]
+    for start, end in reversed(wins):
+        if deadline is not None and time.monotonic() > deadline:
+            print(f"  !! frist naadd i metadata — stopper ved {start[:7]}", flush=True)
+            break
         got = fetch_window(start, end)
         rows.extend(got)
         print(f"  {start[:7]}: {len(got)} markeder (totalt {len(rows)})", flush=True)
-    df = pd.DataFrame(rows).drop_duplicates(subset="market_id")
-    return df
+        if on_month:
+            on_month(rows)          # delvis lagring, saa arbeidet ikke gaar tapt
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).drop_duplicates(subset="market_id")
 
 
 def fetch_price_history(token_id, fidelity):
@@ -353,6 +367,9 @@ def main():
                     help="Brukes hvis --since ikke er satt: hent kun markeder avsluttet "
                          "de siste N dagene (eldre historikk er permanent slettet av API-et). "
                          "0 = ingen grense.")
+    ap.add_argument("--tag-backfill-days", type=int, default=300,
+                    help="Ved manglende tags: hent metadata bare saa langt tilbake. "
+                         "Eldre markeder har uansett ingen prishistorikk i CLOB.")
     ap.add_argument("--max-seconds", type=int, default=18900,
                     help="Avslutt pent etter saa mange sekunder (default 5t15m)")
     args = ap.parse_args()
@@ -392,12 +409,48 @@ def main():
             markets.to_parquet(markets_path, index=False)
             print(f"Metadata oppdatert: {len(fresh_df)} markeder refetchet, {n_new} nye. Totalt {len(markets)}.")
     if not meta_ok:
-        if markets_path.exists():
-            print("Fant ufullstendig metadata fra tidligere kjoring — henter paa nytt.")
-        print("Henter alle markeder (maaned for maaned) ...")
-        markets = fetch_all_markets()
-        if markets.empty:
+        have = markets_path.exists()
+        old_df = pd.read_parquet(markets_path) if have else pd.DataFrame()
+        # Full gjenoppbygging tar lengre tid enn Actions tillater. Hent bare den
+        # perioden som faktisk har prishistorikk, og flett inn i det vi har.
+        since = None
+        if have and len(old_df):
+            since = (date.today() - timedelta(days=args.tag_backfill_days)).isoformat()
+            print(f"Henter metadata paa nytt fra {since} og flettes inn i "
+                  f"{len(old_df)} eksisterende rader.")
+        else:
+            print("Henter alle markeder (maaned for maaned) ...")
+
+        # Reserver tid til prisløkka og publisering — metadata faar hoyst halve budsjettet.
+        meta_deadline = t0 + args.max_seconds * 0.5
+
+        def save_partial(rows):
+            if not rows:
+                return
+            part = pd.DataFrame(rows).drop_duplicates(subset="market_id")
+            merged = (pd.concat([old_df[~old_df["market_id"].isin(part["market_id"])], part],
+                                ignore_index=True) if len(old_df) else part)
+            merged.to_parquet(markets_path, index=False)
+
+        fresh = fetch_all_markets(since_iso=since, deadline=meta_deadline,
+                                  on_month=save_partial)
+        if fresh.empty and not len(old_df):
             raise SystemExit("Fikk ingen markeder — se loggen for HTTP-feil.")
+        markets = (pd.concat([old_df[~old_df["market_id"].isin(fresh["market_id"])], fresh],
+                             ignore_index=True) if len(old_df) and len(fresh)
+                   else (fresh if len(fresh) else old_df))
+        markets = markets.drop_duplicates(subset="market_id")
+        print(f"Metadata: {len(fresh)} hentet paa nytt, {len(markets)} totalt.")
+
+        # Regn om kategori for ALLE rader — ogsaa de gamle, som naa nyter godt av
+        # den utvidede nokkelordslista selv om de mangler tags.
+        def _recat(r):
+            try:
+                tg = json.loads(r["tags"]) if isinstance(r["tags"], str) else (r["tags"] or [])
+            except (json.JSONDecodeError, TypeError):
+                tg = []
+            return categorize({"tags": tg, "question": r["question"]})
+        markets["category"] = markets.apply(_recat, axis=1)
         markets.to_parquet(markets_path, index=False)
         META_DONE.write_text("ok")
         print(f"Lagret {len(markets)} markeder -> {markets_path}")
