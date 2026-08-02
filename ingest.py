@@ -412,10 +412,17 @@ def main():
         # den inkrementelle veien beholdt 687k feilkategoriserte rader for alltid.
         filled = (markets["tags"].astype(str).str.len() > 2).mean() \
             if "tags" in markets.columns else 0.0
-        if filled > 0.5:
+        # Samme selvhelbredende monster som for tags: mangler en kolonne vi naa
+        # trenger, hentes metadata paa nytt av seg selv. Aa maatte huske aa slette
+        # meta_complete.flag manuelt er en feil som skjer stille.
+        has_evt = "event_start" in markets.columns
+        if filled > 0.5 and has_evt:
             meta_ok = True
             print(f"Bruker komplett metadata: {len(markets)} markeder "
                   f"({filled*100:.0f} % med tags)")
+        elif not has_evt:
+            print("Metadata mangler kolonnen event_start (det ekte handelsvinduet) "
+                  "— henter paa nytt.")
         else:
             print(f"Metadata har tags paa bare {filled*100:.1f} % av radene — "
                   f"henter alt paa nytt med include_tag=true.")
