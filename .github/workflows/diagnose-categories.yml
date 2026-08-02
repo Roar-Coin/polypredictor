@@ -1,16 +1,9 @@
-# .github/workflows/diagnose.yml
-# Engangs-diagnose. Henter ned metadata fra R2 og leser den. Skriver ingenting tilbake.
+# .github/workflows/diagnose-categories.yml
+# Engangsprober mot Gamma og CLOB. Ingen R2, ingen skriving.
 name: diagnose-categories
 
 on:
   workflow_dispatch:
-
-env:
-  R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
-  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
 
 jobs:
   diagnose:
@@ -24,14 +17,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install deps
-        run: pip install --quiet pandas pyarrow requests awscli
-
-      
-   
-          mkdir -p data
-          aws s3 cp "s3://hindsight-data/raw/markets.parquet" data/markets.parquet \
-            --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-          ls -lh data/markets.parquet
+        run: pip install --quiet requests
 
       - name: Probe window
         run: python probe_window.py
