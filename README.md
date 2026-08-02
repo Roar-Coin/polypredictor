@@ -1,10 +1,30 @@
 # Hindsight — statusdokument
-*Backtesting for Polymarket. Sist oppdatert 2. august 2026.*
+*Backtesting for Polymarket. Sist oppdatert 2. august 2026 (kveld).*
 
 ## Ved oppstart av ny chat
 Last opp disse fem filene sammen: **denne filen**, `app.html`, `index.html`,
 `ingest.py`, `ingest.yml`. Arbeidsfiler lagres ikke mellom samtaler, og de
 inneholder mange små fikser som ikke kan gjenskapes fra hukommelsen.
+
+**Last alltid opp den versjonen som faktisk kjører.** Filene endres mellom
+samtaler, og en patch bygget på en gammel kopi sletter arbeid stille.
+
+### Der vi står akkurat nå (2. aug, kveld)
+En ingest-kjøring er i gang med den nye `ingest.py` (event_start + vindus-kall).
+Det første som skal sjekkes i neste samtale er loggen fra den:
+- **«Metadata mangler kolonnen event_start — henter paa nytt»** skal stå tidlig.
+  Gjør den ikke det, ble feil versjon lagt inn.
+- **«herav N med oppgjorsvindu <= 60 min og volum >= $5,000»** — dette tallet
+  avgjør om retroaktiv henting er en kort ekstrarunde eller flere fulle kjøringer.
+- **«X finkornede vinduer»** i progresjonslinjene. Ventes å være lavt denne
+  kjøringen: sjekkpunktet gjør at markeder som allerede er hentet hoppes over,
+  så vindus-kallet treffer bare nye markeder. Retroaktiv henting krever at de
+  aktuelle markedene fjernes fra `checkpoint.json` — en egen beslutning.
+
+**Rett etter kjøringen:** `app.html` må patches. Varighetsfilteret bruker
+fortsatt `(end_epoch - start_epoch)/60` og skal bruke
+`COALESCE(event_epoch, start_epoch)`. Uten det finner «≈ 5 min» fortsatt
+ingenting, selv om dataene nå er riktige.
 
 ## Hva produktet er
 Nettside der brukeren tester handelsregler mot avsluttede Polymarket-markeder.
@@ -27,6 +47,8 @@ arkivet er derfor vollgraven — det kan ikke kopieres i etterkant.
 | Nettside | Cloudflare Workers (static upload), `hindsight.roar-martinussen.workers.dev` |
 | Domene | `hindsight.software` — kjøpt, ikke koblet ennå |
 | GitHub secrets | `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` |
+| X-konto | `@hindsightsw` — egen produktkonto, lenket fra nav og bunntekst |
+| E-postfangst | Formspree `https://formspree.io/f/xojgpbvv`, testet og virker |
 | Worker-hemmeligheter | `GH_TOKEN` (fine-grained PAT, Actions read+write), valgfritt `ALERT_WEBHOOK`, `TRIGGER_SECRET` |
 
 **Hvorfor cron ligger i Cloudflare:** GitHubs planlagte kjøringer lå konsekvent
@@ -38,6 +60,20 @@ repoet aktivt — `schedule`-utløsere deaktiveres etter 60 dagers inaktivitet, 
 
 **PAT-en utløper.** Da svarer dispatch 401 og innsamlingen stopper stille.
 `ALERT_WEBHOOK` er den halvparten av Worker-en som faktisk beskytter arkivet.
+
+## Filer i repoet
+| Fil | Hva |
+|---|---|
+| `ingest.py` | innhenting, kategorisering, publisering |
+| `.github/workflows/ingest.yml` | kun `workflow_dispatch` + `concurrency` |
+| `.github/workflows/diagnose-categories.yml` | engangsprober, byttes ut etter behov |
+| `.github/workflows/cleanup-r2.yml` | rydder duplikater etter omkategorisering |
+| `cleanup_r2_categories.py` | tørrkjøring først, `--apply` for å slette |
+| `diagnose_categories.py` | hvorfor havner markeder i «other» |
+| `probe_short.py` | finnes korte markeder, og har de volum |
+| `probe_window.py` | hvor ligger det ekte handelsvinduet |
+| `probe_interval.py` | hvilke CLOB-parametere gir fin oppløsning |
+| Cloudflare Worker `hindsight-cron` | `worker.js` + `wrangler.toml`, egen deploy |
 
 ## Dataflyt
 1. Ingest henter markeder fra Gamma-API-et (måned-for-måned, nyeste først, splitter
@@ -209,6 +245,41 @@ finne noe tilfeldig.
 Dette er den beste illustrasjonen av hvorfor det daglige arkivet er vollgraven:
 spørsmålet svarer seg selv hvis innsamlingen bare fortsetter.
 
+## Korte kryptomarkeder: hva som faktisk er sant
+Undersøkt 2. august med tre prober. Konklusjonene er ikke intuitive:
+
+**«5-minutters» markeder er 24-timersmarkeder.** «Bitcoin Up or Down – July 19,
+6:15PM-6:20PM ET» har `eventStartTime` 22:15Z og `endDate` 22:20Z — de fem
+minuttene er *oppgjørsvinduet*. Boken åpner et døgn før, og første prispunkt
+ligger på 50,5¢ dagen i forveien. `startDate` er opprettelsestidspunktet, så
+varighet regnet derfra blir 1430 minutter i stedet for 5.
+
+**De har alltid ligget i arkivet.** BTC-markedene har $120 000–140 000 i volum,
+langt over ethvert gulv. De var bare umulige å finne, fordi appens
+varighetsfilter la dem i «> 1 dag».
+
+**Bare BTC handles.** Av seks samtidige 7:50–7:55-markeder: Bitcoin $34 762,
+Dogecoin $349, BNB $159, og Ethereum, Solana og XRP null.
+
+**Den reelle begrensningen var aldri fidelity.** CLOB returnerer ~144 punkter
+uansett `fidelity` når `interval=max`. Et døgnlangt marked får derfor ti
+minutters oppløsning, og de avgjørende minuttene glattes bort. Målt:
+
+| Variant | Punkter | Sek mellom |
+|---|---|---|
+| `interval=max`, fidelity=1 | 145 | 600 |
+| `interval=1h` eller `6h` | 0 | — |
+| `startTs`/`endTs` | 32 | **60** |
+| `start_ts`/`end_ts` | HTTP 400 | — |
+
+`interval` og `startTs` kan ikke kombineres. Løsningen er smalere vindu, ikke
+høyere fidelity. 60 sekunder er gulvet CLOB serverer.
+
+**Hva dette åpner:** en helt ny regelklasse — noe som skjer i minuttene rundt
+oppgjør, i markeder med sekssifret volum og en bok som har stått åpen i et døgn.
+Kapasitetsproblemet som begrenser kryptofordelen i $1000–5000-markedene ser
+fundamentalt annerledes ut her.
+
 ## Ubesvart, i prioritert rekkefølge
 1. **`gameStartTime`** finnes på sportsmarkeder i Gamma og er publisert på forhånd.
    Det gjør «kjøp 30 minutter etter avspark» til en implementerbar regel — den
@@ -247,10 +318,25 @@ spørsmålet svarer seg selv hvis innsamlingen bare fortsetter.
 - **`\b` matcher ikke foran kolon** — nøkkelordet «spread:» traff aldri.
 
 ## Gjenstår før lansering
-1. Formspree-endepunkt inn i `index.html` (`SIGNUP_ENDPOINT`) for e-postfangst
-2. Koble `hindsight.software` i Workers-prosjektet (navnetjener-bytte hos registraren)
-3. Sjekk at appens kategorimeny leser `manifest.json` dynamisk (skal vise ni valg)
-4. Første X-post: retention-funnet + sveip-grafen
+1. ~~Formspree~~ — koblet og testet 2. august
+2. ~~X-konto og lenker på siden~~ — `@hindsightsw` opprettet, ikon i nav og bunntekst
+3. ~~Tall på forsiden~~ — rettet til «120 000+», ni kategorier
+4. **Koble `hindsight.software`** i Workers-prosjektet (navnetjener-bytte hos
+   registraren). Siste tekniske hinder før første post.
+5. `app.html`: varighetsfilter til `COALESCE(event_epoch, start_epoch)`
+6. Første X-post. Utkast klart (se under). Post tirsdag–torsdag 14–16 norsk tid,
+   som treffer amerikansk formiddag. **Ikke før domenet er koblet.**
+
+**Festet innlegg, klart til bruk:**
+
+> A sports rule I tested showed +$33,146 over 7,423 trades.
+>
+> Then I changed one setting — from "last trade" to "oracle resolution."
+>
+> Same rule. Same markets. −$11,075.
+>
+> The filter used information I couldn't have had at entry time. That's why I
+> built Hindsight.
 
 **Innholdsidé med god dekning:** «Hvorfor de fleste backtester lyver» — de tre
 sportskandidatene er et rent, konkret eksempel på framtidsinnsyn i filtre, og
