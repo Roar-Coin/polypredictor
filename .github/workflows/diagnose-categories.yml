@@ -33,5 +33,5 @@ jobs:
             --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
           ls -lh data/markets.parquet
 
-      - name: Probe tags
-        run: python probe_short.py
+      - name: Probe window
+        run: python probe_window.py
