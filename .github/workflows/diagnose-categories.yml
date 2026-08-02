@@ -34,4 +34,4 @@ jobs:
           ls -lh data/markets.parquet
 
       - name: Probe tags
-        run: python probe_tags.py
+        run: python probe_short.py
