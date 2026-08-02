@@ -49,13 +49,16 @@ def tokens(m):
 def main():
     today = datetime.now(timezone.utc).date()
     rows = []
-    for d in range(1, 4):
+    # Samme sortering som probe 1. Uten den gir de forste 500 per dogn et annet
+    # utvalg, og de kortlivede markedene faller utenfor.
+    for d in range(1, 15):
         day = (today - timedelta(days=d)).isoformat()
         nxt = (today - timedelta(days=d - 1)).isoformat()
         for off in (0, 500, 1000, 1500, 2000):
             try:
                 b = get(f"{GAMMA}/markets", closed="true", limit=500, offset=off,
-                        include_tag="true", end_date_min=day, end_date_max=nxt)
+                        include_tag="true", end_date_min=day, end_date_max=nxt,
+                        order="endDate", ascending="false")
             except requests.HTTPError:
                 break
             if not b:
@@ -81,7 +84,17 @@ def main():
 
     print(f"{len(rows)} markeder hentet · {len(short)} med kort vindu i tittelen\n")
     if not short:
-        print("Fant ingen. Prov flere dogn.")
+        # Uten dette maa man gjette paa hvorfor. Vis hva vi faktisk maalte mot.
+        ups = [str(m.get("question") or "") for m in rows
+               if "up or down" in str(m.get("question") or "").lower()]
+        print(f"{len(ups)} markeder har 'Up or Down' i tittelen. Forste 15:")
+        for q in ups[:15]:
+            print(f"    {q}")
+        hits = [q for q in ups if WINDOW.search(q)]
+        print(f"\n{len(hits)} av dem matcher vindus-monsteret i det hele tatt.")
+        for q in hits[:5]:
+            w = WINDOW.search(q)
+            print(f"    {q}\n      -> '{w.group(1)}' til '{w.group(2)}'")
         return
 
     short.sort(key=lambda x: -float(x.get("volume") or 0))
