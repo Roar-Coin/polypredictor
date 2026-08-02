@@ -187,6 +187,10 @@ def parse_market(m):
         "outcomes": json.dumps(outcomes),
         "token_ids": json.dumps(token_ids or []),
         "start_date": m.get("startDate"),
+        # Det EKTE handelsvinduet. startDate er naar markedet ble opprettet — for
+        # "Bitcoin Up or Down - 6:15PM-6:20PM" er den et dogn for oppgjor, saa
+        # varighet regnet fra start_date blir 1430 min i stedet for 5.
+        "event_start": m.get("eventStartTime") or m.get("gameStartTime"),
         "end_date": m.get("endDate"),
         "volume": float(m.get("volumeNum") or m.get("volume") or 0),
         "liquidity": float(m.get("liquidityNum") or m.get("liquidity") or 0),
@@ -275,11 +279,22 @@ def fetch_all_markets(since_iso=None, deadline=None, on_month=None) -> pd.DataFr
     return pd.DataFrame(rows).drop_duplicates(subset="market_id")
 
 
-def fetch_price_history(token_id, fidelity):
-    """DataFrame = data, None = bekreftet ingen historikk, ERROR = kallet feilet."""
-    data = get_json(f"{CLOB}/prices-history", {
-        "market": token_id, "interval": "max", "fidelity": fidelity,
-    }, attempts=3)
+def fetch_price_history(token_id, fidelity, window=None):
+    """DataFrame = data, None = bekreftet ingen historikk, ERROR = kallet feilet.
+
+    window=(fra_epoch, til_epoch) ber om et smalt utsnitt i stedet for hele
+    levetiden. Det er den eneste maaten aa faa fin opplosning paa: CLOB gir
+    ~144 punkter uansett fidelity naar interval=max, saa et dognlangt marked
+    med fem minutters oppgjorsvindu ender paa ti minutter mellom punktene.
+    Med startTs/endTs over samme vindu faar man 60 sekunder. Merk at interval
+    og startTs ikke kan kombineres — da returnerer CLOB tomt.
+    """
+    params = {"market": token_id, "fidelity": fidelity}
+    if window:
+        params["startTs"], params["endTs"] = int(window[0]), int(window[1])
+    else:
+        params["interval"] = "max"
+    data = get_json(f"{CLOB}/prices-history", params, attempts=3)
     if data is ERROR:
         return ERROR
     if not data:
@@ -347,6 +362,9 @@ def publish(markets):
     mk = markets.copy()
     mk["start_epoch"] = to_epoch(mk["start_date"])
     mk["end_epoch"] = to_epoch(mk["end_date"])
+    # Appen kan naa regne varighet fra handelsvinduet i stedet for opprettelsen
+    mk["event_epoch"] = (to_epoch(mk["event_start"]) if "event_start" in mk.columns
+                         else pd.Series(pd.NA, index=mk.index))
     mk.to_parquet(pub / "markets.parquet", index=False)
     (pub / "manifest.json").write_text(json.dumps(manifest))
     print(f"Publisert {len(manifest['categories'])} kategorier til data/publish/ "
@@ -356,6 +374,13 @@ def publish(markets):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fidelity", type=int, default=60)
+    ap.add_argument("--zoom-max-minutes", type=int, default=60,
+                    help="Hent ekstra finkornet vindu naar oppgjorsvinduet er "
+                         "kortere enn dette (0 = av).")
+    ap.add_argument("--zoom-min-volume", type=float, default=5000,
+                    help="Bare for markeder over dette volumet — ett ekstra kall hver.")
+    ap.add_argument("--zoom-pad-minutes", type=int, default=15,
+                    help="Hvor lenge for event_start vinduet skal begynne.")
     ap.add_argument("--category", default=None)
     ap.add_argument("--min-volume", type=float, default=0)
     ap.add_argument("--short-min-volume", type=float, default=200,
@@ -502,17 +527,21 @@ def main():
               f"(eldre historikk finnes ikke i API-et)")
     # Varighet i minutter — brukes til aa avgjore om minutt-fallback er meningsfullt
     sel = sel.copy()
-    sel["_dur_min"] = (pd.to_datetime(sel["end_date"], errors="coerce", utc=True)
-                       - pd.to_datetime(sel["start_date"], errors="coerce", utc=True)
-                       ).dt.total_seconds() / 60
+    _end = pd.to_datetime(sel["end_date"], errors="coerce", utc=True)
+    _evt = (pd.to_datetime(sel["event_start"], errors="coerce", utc=True)
+            if "event_start" in sel.columns else pd.Series(pd.NaT, index=sel.index))
+    _beg = _evt.fillna(pd.to_datetime(sel["start_date"], errors="coerce", utc=True))
+    sel["_dur_min"] = (_end - _beg).dt.total_seconds() / 60
+    # Oppgjorsvinduet alene — finnes bare naar event_start er satt
+    sel["_settle_min"] = (_end - _evt).dt.total_seconds() / 60
+    sel["_evt_ts"] = _evt.astype("int64").where(_evt.notna()) // 10**9
+    sel["_end_ts"] = _end.astype("int64").where(_end.notna()) // 10**9
     # Mest verdifulle markeder forst, saa et avbrutt lop aldri mister det som betyr noe
     sel = sel.sort_values("volume", ascending=False, na_position="last")
     if args.category:
         sel = sel[sel["category"] == args.category]
     if args.min_volume > 0:
-        dur_min = (pd.to_datetime(sel["end_date"], errors="coerce", utc=True)
-                   - pd.to_datetime(sel["start_date"], errors="coerce", utc=True)
-                   ).dt.total_seconds() / 60
+        dur_min = sel["_dur_min"]
         short = dur_min.notna() & (dur_min <= 300)  # <= 5 timer (5m/15m/1h/4h-markeder)
         sel = sel[(sel["volume"] >= args.min_volume)
                   | (short & (sel["volume"] >= args.short_min_volume))]
@@ -543,6 +572,7 @@ def main():
               f"({len(done)}/{len(sel)} avklart, {len(nohist)} uten historikk totalt"
               + (f", {err_skipped} utsatt pga. serverfeil" if err_skipped else "") + ")", flush=True)
 
+    zoomed = 0
     for i, (_, m) in enumerate(sel.iterrows(), 1):
         if time.monotonic() - t0 > args.max_seconds:
             stop_cleanly()
@@ -556,6 +586,17 @@ def main():
         # Minuttdata er bare relevant for markeder som er for korte til aa gi timesbarer.
         # Aa prove det paa alle doblet antall API-kall uten aa gi ny data.
         is_short = bool(pd.notna(m["_dur_min"]) and m["_dur_min"] <= 300)
+        # Kort oppgjorsvindu i et marked som har vaert apent lenge: der ligger
+        # hele avgjorelsen i minuttene rundt event_start, og interval=max
+        # glatter dem bort. Kostnaden er ett ekstra kall, saa bare der volumet
+        # gjor det verdt det.
+        settle = m.get("_settle_min")
+        zoom = None
+        if (pd.notna(settle) and settle <= args.zoom_max_minutes
+                and float(m["volume"] or 0) >= args.zoom_min_volume
+                and pd.notna(m.get("_evt_ts")) and pd.notna(m.get("_end_ts"))):
+            zoom = (int(m["_evt_ts"]) - args.zoom_pad_minutes * 60,
+                    int(m["_end_ts"]) + 300)
         for j, tok in enumerate(json.loads(m["token_ids"])):
             df = fetch_price_history(tok, args.fidelity)
             if df is ERROR:
@@ -568,7 +609,20 @@ def main():
                     used_fallback = True
             if df is not None and df is not ERROR:
                 df["outcome_index"] = j
+                df["fidelity_min"] = args.fidelity
                 frames.append(df)
+            if zoom:
+                zf = fetch_price_history(tok, 1, window=zoom)
+                if zf is ERROR:
+                    had_error = True
+                elif zf is not None and len(zf):
+                    # Supplerer, erstatter ikke: dognet for oppgjor er kontekst
+                    # for enhver regel om hva som skjedde i vinduet.
+                    zf["outcome_index"] = j
+                    zf["fidelity_min"] = 1
+                    frames.append(zf)
+                    zoomed += 1
+                time.sleep(0.12)
             time.sleep(0.12)
 
         if frames:
@@ -577,7 +631,12 @@ def main():
             if used_fallback:
                 for fr in frames:
                     fr["fidelity_min"] = 1
-            pd.concat(frames).to_parquet(out_dir / f"{mid}.parquet", index=False)
+            out = pd.concat(frames)
+            # Vindus-kallet overlapper det grove; behold det fineste per tidspunkt
+            out = (out.sort_values("fidelity_min")
+                      .drop_duplicates(subset=["outcome_index", "timestamp"], keep="first")
+                      .sort_values(["outcome_index", "timestamp"]))
+            out.to_parquet(out_dir / f"{mid}.parquet", index=False)
             on_disk_new.add(mid)
             done.add(mid)
             consec_err = 0
@@ -597,7 +656,7 @@ def main():
         if i % 50 == 0:
             save_checkpoint(done)
             save_nohistory(nohist)
-            print(f"  {i}/{len(sel)} sjekket · {len(on_disk_new)} nye prisfiler "
+            print(f"  {i}/{len(sel)} sjekket · {zoomed} finkornede vinduer · {len(on_disk_new)} nye prisfiler "
                   f"· {len(nohist)} uten historikk"
                   + (f" · {err_skipped} utsatt pga. serverfeil" if err_skipped else ""),
                   flush=True)
