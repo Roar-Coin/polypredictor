@@ -20,4 +20,4 @@ jobs:
         run: pip install --quiet requests
 
       - name: Probe window
-        run: python probe_window.py
+        run: python probe_interval.py
