@@ -26,7 +26,7 @@ jobs:
       - name: Install deps
         run: pip install --quiet pandas pyarrow requests awscli
 
-      - name: Fetch markets.parquet from R2
+      
         run: |
           mkdir -p data
           aws s3 cp "s3://hindsight-data/raw/markets.parquet" data/markets.parquet \
