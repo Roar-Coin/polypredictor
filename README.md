@@ -92,7 +92,9 @@ Settlement (strict = eksakt 0/1, loose = innenfor 0,5¢)
 - **Cost sweep** — 0–3¢, viser hvor fordelen dør (rått, naivt CI, klynget CI)
 - **Stability** — første mot andre halvdel av arkivet, med dom i overskriften
 - **Cluster correction** — effektiv N med ρ̂ fra ANOVA og et gulv der hver klynge
-  teller som ett veddemål
+  teller som ett veddemål. **Bruk «subject + dag», ikke bare «dag».** Subject er
+  mynt for krypto, by for vær, kamp for sport/esport. Med ren dagsnøkkel måler
+  gulvet arkivets lengde, ikke strategien.
 - Kjørelogg i terminalstil
 - Fallback: last inn lokale parquet-filer under «Advanced»
 
@@ -132,12 +134,17 @@ Fem hypoteser testet og **eliminert**:
 5. *Skjevt myntutvalg* — da universet vokste 53 % (BNB og småmynter kom med),
    **økte** fordelen. Den var altså ikke en artefakt av nøkkelordslista.
 
+**Strukturell risiko:** fordelen hviler på få uavhengige hendelser. 2229 handler er
+bare **154 mynt-dager** — det finnes rundt seksten mynter i universet, og på en dag
+der BTC faller, feiler alle BTC-markedene sammen. Diversifiseringen er dårligere
+enn handelstallet antyder.
+
 **Gjenstår:**
 - Faktisk fyllkostnad i ordreboken på 93–97¢-markeder med $1000–5000 volum.
-  Dette er det eneste som avgjør om fordelen er ekte penger. Over 1,71¢ er den død.
-- Klyngegulvet feiler fortsatt, men det måler **arkivets lengde**, ikke strategien:
-  36 klynger over 37 dager krever ~6,9 pp for å klare null. Ved 180 dager kreves
-  ~3 pp, ved 365 dager ~2,1 pp. Løser seg av seg selv hvis innsamlingen fortsetter.
+  Dette er det eneste som avgjør om fordelen er ekte penger. Over 1,71¢ er den død,
+  uansett hvor mye arkiv som samles. **Høyeste prioritet — venter ikke på noe.**
+- Klyngegulvet med subject + dag: 154 klynger, ±3,0 pp mot +1,9 pp fordel. Feiler,
+  men langt nærmere enn med ren dagsnøkkel (36 klynger, ±6,9 pp).
 - Andre halvdel gir +2,4 pp mot første halvdels +1,3. Kan være støy, kan være regime.
 
 ## Sport: undersøkelsen er lukket
@@ -168,6 +175,40 @@ informasjon du ikke har på forhånd.**
 **Konklusjon:** terskelregler på pris alene virker ikke i sport. Det er *ikke* det
 samme som at sport er uinteressant — se «Ubesvart» under.
 
+## Vær: den eneste lovende nye kandidaten
+Vær, 88¢, volumkrav 0, 0,5¢ kostnad, oracle resolution: 13 762 handler, 94,9 % treff,
++0,9 pp, $13 755.
+
+**Det som taler for:**
+- Terskelsveipet har **pukkel, ikke helling** — −1,4 pp ved 70¢, topp +1,3 ved 80¢,
+  −1,5 ved 99¢. Sport falt monotont (effisient); krypto har samme pukkelform.
+  Nesten hele P&L sitter i 80–93¢.
+- Summeringstesten er ren: ≥70¢ gir +$15 840, ≤30¢ gir −$692 105. Ingen umulig
+  dobbeltgevinst slik volumfilteret ga i sport.
+- Utfallet avgjøres av en målestasjon, ikke av orakelskjønn. Ingen tvistrisiko.
+- **Flest uavhengige hendelser av alle kategoriene**: 1362 by-dager mot kryptos 154.
+
+**Det som taler mot:**
+- Stabilitetstesten svikter — bare andre halvdel klarer null.
+- Fordelen dør ved ~1,4¢. Klaringen er ~0,9¢, mot kryptos 1,21¢.
+- Gulvet klarer ikke null: ±1,2 pp mot +0,9 pp fordel.
+- ρ̂ = 0,00 selv med by-nøkkel. Overraskende — burde «36 °C i Taipei» og «37 °C i
+  Taipei» ikke falle sammen? Kan bety at markedene er «minst X» heller enn «eksakt
+  X», eller at 94,9 % treff gir estimatoren for få tapere å måle på.
+
+## Begge kandidatene venter på arkivlengde
+Verken krypto eller vær er avkreftet — de er ikke bevist. Begge feiler klyngegulvet,
+og det løses av tid, ikke av flere sveip. Flere kjøringer nå øker bare sjansen for å
+finne noe tilfeldig.
+
+| | Klynger nå | Kreves | Estimert tid |
+|---|---|---|---|
+| Krypto (+1,9 pp, p=98,2 %) | 154 | ~240 | ~3 uker |
+| Vær (+0,9 pp, p=94,9 %) | 1362 | ~2400 | ~4 uker |
+
+Dette er den beste illustrasjonen av hvorfor det daglige arkivet er vollgraven:
+spørsmålet svarer seg selv hvis innsamlingen bare fortsetter.
+
 ## Ubesvart, i prioritert rekkefølge
 1. **`gameStartTime`** finnes på sportsmarkeder i Gamma og er publisert på forhånd.
    Det gjør «kjøp 30 minutter etter avspark» til en implementerbar regel — den
@@ -176,7 +217,9 @@ samme som at sport er uinteressant — se «Ubesvart» under.
 2. **Undernivå-filter.** 378 713 sportsmarkeder spenner fra NBA-finaler til ITF i
    Kiseljak. At snittet er effisient sier ingenting om delene, men appen mangler
    tekst- eller tag-filter, så spørsmålet kan ikke stilles.
-3. **Vær og esports** er aldri testet. 40 967 og 59 620 markeder.
+3. **Esports** er aldri testet. 59 620 markeder. Merk at mange er `Map Handicap` og
+   `Games Total` på obskure kamper — sportens ITF-hale uten toppsjiktet. Vær ekstra
+   streng med stabilitetstesten; esports-scener endrer seg raskt.
 
 ## Fallgruver som er løst (ikke gjenta)
 - **`include_tag=true`** — se eget avsnitt. Feiler stille.
