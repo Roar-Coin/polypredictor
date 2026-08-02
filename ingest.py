@@ -554,6 +554,15 @@ def main():
                   | (short & (sel["volume"] >= args.short_min_volume))]
     sel = sel[sel["token_ids"] != "[]"]
     print(f"Henter prishistorikk for {len(sel)} markeder (fidelity={args.fidelity}m)")
+    # Hvor stort er vindus-arbeidet? To ekstra kall per marked, saa dette avgjor
+    # om det er en kort ekstrarunde eller flere fulle kjoringer.
+    _z = sel[sel["_settle_min"].notna()
+             & (sel["_settle_min"] <= args.zoom_max_minutes)
+             & (sel["volume"] >= args.zoom_min_volume)]
+    print(f"  herav {len(_z)} med oppgjorsvindu <= {args.zoom_max_minutes} min "
+          f"og volum >= ${args.zoom_min_volume:,.0f} — disse faar et ekstra "
+          f"finkornet kall (~{len(_z) * 2 * 0.24 / 3600:.1f} t for de som ikke "
+          f"allerede staar i sjekkpunktet)", flush=True)
 
     on_disk = {f.stem for f in PRICES_DIR.glob("*/*.parquet")}
     nohist = load_nohistory()
