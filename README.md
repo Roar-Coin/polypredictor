@@ -1,5 +1,5 @@
 # Hindsight — statusdokument
-*Backtesting for Polymarket. Sist oppdatert 2. august 2026 (kveld).*
+*Backtesting for Polymarket. Sist oppdatert 3. august 2026.*
 
 ## Ved oppstart av ny chat
 Last opp disse fem filene sammen: **denne filen**, `app.html`, `index.html`,
@@ -9,9 +9,9 @@ inneholder mange små fikser som ikke kan gjenskapes fra hukommelsen.
 **Last alltid opp den versjonen som faktisk kjører.** Filene endres mellom
 samtaler, og en patch bygget på en gammel kopi sletter arbeid stille.
 
-### Der vi står akkurat nå (2. aug, kveld)
-En ingest-kjøring er i gang med den nye `ingest.py` (event_start + vindus-kall).
-Det første som skal sjekkes i neste samtale er loggen fra den:
+### Der vi står akkurat nå (3. aug)
+En ingest-kjøring med den nye `ingest.py` (event_start + vindus-kall) ble startet
+2. august om kvelden. Loggen fra den er ikke lest ennå — det er første sak:
 - **«Metadata mangler kolonnen event_start — henter paa nytt»** skal stå tidlig.
   Gjør den ikke det, ble feil versjon lagt inn.
 - **«herav N med oppgjorsvindu <= 60 min og volum >= $5,000»** — dette tallet
@@ -21,10 +21,12 @@ Det første som skal sjekkes i neste samtale er loggen fra den:
   så vindus-kallet treffer bare nye markeder. Retroaktiv henting krever at de
   aktuelle markedene fjernes fra `checkpoint.json` — en egen beslutning.
 
-**Rett etter kjøringen:** `app.html` må patches. Varighetsfilteret bruker
-fortsatt `(end_epoch - start_epoch)/60` og skal bruke
-`COALESCE(event_epoch, start_epoch)`. Uten det finner «≈ 5 min» fortsatt
-ingenting, selv om dataene nå er riktige.
+**`app.html` er allerede patchet og deployet.** Varighetsfilteret og
+`mins_from_start` bruker `COALESCE(event_epoch, start_epoch)`, med en skjemasjekk
+som faller tilbake på `start_epoch` og logger en advarsel hvis datasettet er eldre
+enn kolonnen. Det som gjenstår er derfor en *test*, ikke en patch: velg krypto,
+varighet «≈ 5 min» og **Min. volume 0**. Finner appen fortsatt ingenting, ligger
+feilen i dataene fra kjøringen, ikke i filteret.
 
 ## Hva produktet er
 Nettside der brukeren tester handelsregler mot avsluttede Polymarket-markeder.
@@ -323,7 +325,8 @@ fundamentalt annerledes ut her.
 3. ~~Tall på forsiden~~ — rettet til «120 000+», ni kategorier
 4. **Koble `hindsight.software`** i Workers-prosjektet (navnetjener-bytte hos
    registraren). Siste tekniske hinder før første post.
-5. `app.html`: varighetsfilter til `COALESCE(event_epoch, start_epoch)`
+5. ~~`app.html`: varighetsfilter til `COALESCE(event_epoch, start_epoch)`~~ —
+   patchet og deployet 2. august
 6. Første X-post. Utkast klart (se under). Post tirsdag–torsdag 14–16 norsk tid,
    som treffer amerikansk formiddag. **Ikke før domenet er koblet.**
 
