@@ -27,7 +27,7 @@ jobs:
         run: pip install --quiet pandas pyarrow requests awscli
 
       
-        run: |
+   
           mkdir -p data
           aws s3 cp "s3://hindsight-data/raw/markets.parquet" data/markets.parquet \
             --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
