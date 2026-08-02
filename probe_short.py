@@ -63,19 +63,33 @@ def history(token, fidelity):
 
 
 def main():
-    since = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
-    print(f"Henter lukkede kryptomarkeder avsluttet etter {since} ...\n")
+    # Gamma avviser offset > 2000 med HTTP 422 — samme grense som ingest.py
+    # loser med rekursiv vindussplitting. Her holder ett dogn per vindu.
+    DAYS = 14
+    today = datetime.now(timezone.utc).date()
+    print(f"Henter lukkede markeder for de siste {DAYS} dogn, ett dogn av gangen ...\n")
 
-    rows, offset = [], 0
-    while offset < 6000:
-        batch = get(f"{GAMMA}/markets", closed="true", limit=500, offset=offset,
-                    include_tag="true", end_date_min=since,
-                    order="endDate", ascending="false")
-        if not batch:
-            break
-        rows += batch
-        offset += 500
-    print(f"{len(rows)} markeder hentet\n")
+    rows = []
+    for d in range(DAYS):
+        day = (today - timedelta(days=d + 1)).isoformat()
+        nxt = (today - timedelta(days=d)).isoformat()
+        offset, got = 0, 0
+        while offset <= 2000:
+            try:
+                batch = get(f"{GAMMA}/markets", closed="true", limit=500, offset=offset,
+                            include_tag="true", end_date_min=day, end_date_max=nxt,
+                            order="endDate", ascending="false")
+            except requests.HTTPError as e:
+                print(f"  {day}: stoppet paa offset {offset} ({e.response.status_code})")
+                break
+            if not batch:
+                break
+            rows += batch
+            got += len(batch)
+            offset += 500
+        flag = "  << traff offset-grensen, kan mangle noen" if got >= 2500 else ""
+        print(f"  {day}: {got}{flag}")
+    print(f"\n{len(rows)} markeder hentet totalt\n")
 
     # Varighet fra startDate/endDate — det appen bruker.
     short, buckets = [], Counter()
