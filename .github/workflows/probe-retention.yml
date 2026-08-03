@@ -1,0 +1,39 @@
+# .github/workflows/probe-retention.yml
+# Engangsprobe: har minuttdata (startTs/endTs) kortere oppbevaring enn timesdata?
+# Leser data/markets.parquet fra R2, henter ingen nye markeder, skriver ingenting tilbake.
+
+name: probe-retention
+
+on:
+  workflow_dispatch:
+
+env:
+  R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install --quiet requests pandas pyarrow awscli
+
+      - name: Hent kun metadata fra R2
+        run: |
+          mkdir -p data
+          aws s3 cp "s3://hindsight-data/raw/markets.parquet" data/markets.parquet \
+            --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
+      - name: Kjor probe
+        run: python probe_retention.py
+
