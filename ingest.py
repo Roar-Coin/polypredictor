@@ -575,8 +575,12 @@ def main():
     sel["_dur_min"] = (_end - _beg).dt.total_seconds() / 60
     # Oppgjorsvinduet alene — finnes bare naar event_start er satt
     sel["_settle_min"] = (_end - _evt).dt.total_seconds() / 60
-    sel["_evt_ts"] = _evt.astype("int64").where(_evt.notna()) // 10**9
-    sel["_end_ts"] = _end.astype("int64").where(_end.notna()) // 10**9
+    # NB: pandas 3 parser ISO-tekst til datetime64[us], ikke [ns]. astype("int64")
+    # gir da MIKROsekunder, og // 10**9 la vinduet i januar 1970. CLOB svarte 200
+    # med tom historikk — aldri en feil, bare ingenting. to_epoch regner via
+    # total_seconds() og er uavhengig av opplosningen.
+    sel["_evt_ts"] = to_epoch(_evt)
+    sel["_end_ts"] = to_epoch(_end)
     # Mest verdifulle markeder forst, saa et avbrutt lop aldri mister det som betyr noe
     sel = sel.sort_values("volume", ascending=False, na_position="last")
     if args.category:
@@ -629,6 +633,7 @@ def main():
 
     zoomed = 0
     backfilled = 0
+    bad_window = 0
     zoom_tries = 0
     zoom_spent = 0.0
     for i, (_, m) in enumerate(sel.iterrows(), 1):
@@ -648,11 +653,19 @@ def main():
         settle = m.get("_settle_min")
         zoom = None
         if (args.zoom_max_minutes > 0 and pd.notna(settle)
-                and settle <= args.zoom_max_minutes
+                and 0 <= settle <= args.zoom_max_minutes
                 and float(m["volume"] or 0) >= args.zoom_min_volume
                 and pd.notna(m.get("_evt_ts")) and pd.notna(m.get("_end_ts"))):
             zoom = (int(m["_evt_ts"]) - args.zoom_pad_minutes * 60,
                     int(m["_end_ts"]) + 300)
+            # Et vindu utenfor rimelighet gir HTTP 200 med tom historikk, ikke en
+            # feil. Uten denne sjekken ser en enhetsbug ut som «ingen data finnes».
+            if not (1_000_000_000 < zoom[0] < zoom[1] < 4_000_000_000):
+                if bad_window == 0:
+                    print(f"  !! ugyldig vindus-tidsstempel {zoom} for {mid} — "
+                          f"hopper over vindus-kall", flush=True)
+                bad_window += 1
+                zoom = None
 
         if mid in done:
             if zoom is None or mid in zoomdone or zoom_spent >= args.zoom_budget_seconds:
@@ -768,6 +781,7 @@ def main():
     print(f"Ferdig. {len(nohist)} markeder manglet CLOB-historikk. "
           f"{zoomed} nye markeder fikk finkornet vindu, {backfilled} eldre ble etterfylt "
           f"({len(zoomdone)} av {len(_z)} kvalifiserte er naa daekket)."
+          + (f" {bad_window} markeder hadde ugyldig vindus-tidsstempel." if bad_window else "")
           + (f" {err_skipped} markeder ble utsatt pga. serverfeil og provers neste kjoring."
              if err_skipped else ""))
 
