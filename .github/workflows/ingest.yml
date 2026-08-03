@@ -1,11 +1,11 @@
-# .github/workflows/ingest.yml — v3
+# .github/workflows/ingest.yml — v4
 # R2 er kilden: datasettet hentes ned ved start og lastes opp ved slutt.
 # GitHub-cachen brukes kun som ekstra backup.
 
 name: polymarket-ingest
 
 on:
-  
+
   workflow_dispatch:
     inputs:
       fidelity:
@@ -20,6 +20,12 @@ on:
       since_days:
         description: "Hent markeder avsluttet siste N dager (0 = alle)"
         default: "180"
+      zoom_budget:
+        description: "Sekunder til vindus-etterfylling (5400 = 1t30m, 10800 = 3t)"
+        default: "5400"
+      reset_zoom:
+        description: "Nullstill vindus-sjekkpunktet forst (true/false)"
+        default: "false"
 
 concurrency:
   group: polymarket-ingest
@@ -64,10 +70,25 @@ jobs:
           echo "Filer i data/prices etter R2-restore:"
           find data/prices -name '*.parquet' 2>/dev/null | wc -l
 
+      # MAA ligge etter begge restore-stegene: cachen henter ellers tilbake fila
+      # vi nettopp slettet. Ingest skriver en fersk zoomed.json ved slutten, og
+      # publiseringssteget overskriver R2-kopien — ingen manuell rydding i R2.
+      - name: Nullstill vindus-sjekkpunkt
+        if: ${{ inputs.reset_zoom == 'true' }}
+        run: |
+          if [ -f data/zoomed.json ]; then
+            python -c "import json;print('  inneholdt',len(json.load(open('data/zoomed.json'))),'markeder')"
+            rm -f data/zoomed.json
+            echo "zoomed.json slettet — alle kvalifiserte markeder proves paa nytt."
+          else
+            echo "zoomed.json fantes ikke — ingenting aa nullstille."
+          fi
+
       - name: Run ingestion
         run: |
           ARGS="--fidelity ${{ inputs.fidelity || '60' }} --min-volume ${{ inputs.min_volume || '1000' }}"
           ARGS="$ARGS --since-days ${{ inputs.since_days || '180' }}"
+          ARGS="$ARGS --zoom-budget-seconds ${{ inputs.zoom_budget || '5400' }}"
           if [ -n "${{ inputs.category }}" ]; then ARGS="$ARGS --category ${{ inputs.category }}"; fi
           python ingest.py $ARGS
 
@@ -92,3 +113,4 @@ jobs:
         with:
           path: data
           key: poly-data-${{ github.run_id }}
+
