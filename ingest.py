@@ -20,6 +20,7 @@ DATA_DIR = Path("data")
 PRICES_DIR = DATA_DIR / "prices"
 CHECKPOINT = DATA_DIR / "checkpoint.json"
 NOHISTORY = DATA_DIR / "nohistory.json"
+ZOOMED = DATA_DIR / "zoomed.json"
 META_DONE = DATA_DIR / "meta_complete.flag"
 
 ERROR = object()   # skiller "API-et feilet" fra "API-et sa: ingen data"
@@ -327,6 +328,35 @@ def save_nohistory(nohist):
     NOHISTORY.write_text(json.dumps(sorted(nohist)))
 
 
+def load_zoomed():
+    """Markeder som allerede har faatt det finkornede vindus-kallet.
+
+    Egen liste fordi `checkpoint.json` betyr 'grov historikk hentet'. Uten
+    dette skillet hopper loekka over hvert eneste marked som ble hentet for
+    vindus-kallet fantes — som er nettopp de vi vil ha finkornet."""
+    if ZOOMED.exists():
+        return set(json.loads(ZOOMED.read_text()))
+    return set()
+
+
+def save_zoomed(zoomdone):
+    ZOOMED.write_text(json.dumps(sorted(zoomdone)))
+
+
+def merge_price_file(path, frames):
+    """Legg nye barer inn i en eksisterende prisfil. Finest fidelity vinner."""
+    if path.exists():
+        try:
+            frames = [pd.read_parquet(path)] + frames
+        except Exception:
+            pass
+    out = pd.concat(frames)
+    out = (out.sort_values("fidelity_min")
+              .drop_duplicates(subset=["outcome_index", "timestamp"], keep="first")
+              .sort_values(["outcome_index", "timestamp"]))
+    out.to_parquet(path, index=False)
+
+
 EPOCH0 = pd.Timestamp("1970-01-01", tz="UTC")
 
 
@@ -381,6 +411,10 @@ def main():
                     help="Bare for markeder over dette volumet — ett ekstra kall hver.")
     ap.add_argument("--zoom-pad-minutes", type=int, default=15,
                     help="Hvor lenge for event_start vinduet skal begynne.")
+    ap.add_argument("--zoom-budget-seconds", type=int, default=5400,
+                    help="Maks tid brukt paa aa etterfylle vinduer i markeder som "
+                         "allerede har grov historikk (default 1t30m). Resten av "
+                         "kjoringen samler nye markeder som vanlig. 0 = av.")
     ap.add_argument("--category", default=None)
     ap.add_argument("--min-volume", type=float, default=0)
     ap.add_argument("--short-min-volume", type=float, default=200,
@@ -577,42 +611,89 @@ def main():
           + (f", {lost} tidligere 'ferdige' uten fil — proves paa nytt" if lost else ""),
           flush=True)
     save_checkpoint(done)
+    zoomdone = load_zoomed()
+    zoom_pending = sum(1 for x in _z["market_id"].astype(str) if x not in zoomdone)
     pending = sum(1 for x in sel["market_id"].astype(str) if x not in done)
     print(f"Koe: {pending} av {len(sel)} markeder i vinduet gjenstaar aa sjekke", flush=True)
+    print(f"Vindus-koe: {zoom_pending} av {len(_z)} kvalifiserte mangler finkornet vindu "
+          f"(budsjett {args.zoom_budget_seconds}s for etterfylling)", flush=True)
 
     def stop_cleanly():
         save_checkpoint(done)
         save_nohistory(nohist)
+        save_zoomed(zoomdone)
         publish(markets)
         print(f"Tidsbudsjett naadd — lagrer og avslutter pent. "
               f"({len(done)}/{len(sel)} avklart, {len(nohist)} uten historikk totalt"
               + (f", {err_skipped} utsatt pga. serverfeil" if err_skipped else "") + ")", flush=True)
 
     zoomed = 0
+    backfilled = 0
+    zoom_tries = 0
+    zoom_spent = 0.0
     for i, (_, m) in enumerate(sel.iterrows(), 1):
         if time.monotonic() - t0 > args.max_seconds:
             stop_cleanly()
             return
         mid = str(m["market_id"])
+        # Kort oppgjorsvindu i et marked som har vaert apent lenge: der ligger
+        # hele avgjorelsen i minuttene rundt event_start, og interval=max
+        # glatter dem bort. Kostnaden er ett ekstra kall, saa bare der volumet
+        # gjor det verdt det.
+        #
+        # VIKTIG: dette maa avgjores FOR sjekkpunkt-hoppet under. `checkpoint.json`
+        # betyr «grov historikk hentet», ikke «ferdig». De mest verdifulle korte
+        # markedene ble hentet lenge for vindus-kallet fantes, saa et `continue`
+        # her gir null finkornede vinduer uansett hvor mange som kvalifiserer.
+        settle = m.get("_settle_min")
+        zoom = None
+        if (args.zoom_max_minutes > 0 and pd.notna(settle)
+                and settle <= args.zoom_max_minutes
+                and float(m["volume"] or 0) >= args.zoom_min_volume
+                and pd.notna(m.get("_evt_ts")) and pd.notna(m.get("_end_ts"))):
+            zoom = (int(m["_evt_ts"]) - args.zoom_pad_minutes * 60,
+                    int(m["_end_ts"]) + 300)
+
         if mid in done:
+            if zoom is None or mid in zoomdone or zoom_spent >= args.zoom_budget_seconds:
+                continue
+            # Etterfylling: kun vindus-kallet. Den grove historikken finnes alt,
+            # saa dette er halve arbeidet av en full refetch.
+            t_zoom = time.monotonic()
+            zoom_tries += 1
+            zframes, zerr = [], False
+            for j, tok in enumerate(json.loads(m["token_ids"])):
+                zf = fetch_price_history(tok, 1, window=zoom)
+                if zf is ERROR:
+                    zerr = True
+                elif zf is not None and len(zf):
+                    zf["outcome_index"] = j
+                    zf["fidelity_min"] = 1
+                    zframes.append(zf)
+                time.sleep(0.12)
+            zoom_spent += time.monotonic() - t_zoom
+            if zframes:
+                out_dir = PRICES_DIR / m["category"]
+                out_dir.mkdir(exist_ok=True)
+                merge_price_file(out_dir / f"{mid}.parquet", zframes)
+                on_disk_new.add(mid)
+                nohist.discard(mid)   # vinduet fant det interval=max ikke gjorde
+                backfilled += 1
+            if not zerr:
+                zoomdone.add(mid)     # serverfeil skal proves paa nytt neste kjoring
+            if zoom_tries % 25 == 0:
+                save_zoomed(zoomdone)
+                save_nohistory(nohist)
+                print(f"  vindus-etterfylling: {backfilled} filer utvidet av "
+                      f"{zoom_tries} forsok · {zoom_spent/60:.0f} min brukt", flush=True)
             continue
+
         frames = []
         used_fallback = False
         had_error = False
         # Minuttdata er bare relevant for markeder som er for korte til aa gi timesbarer.
         # Aa prove det paa alle doblet antall API-kall uten aa gi ny data.
         is_short = bool(pd.notna(m["_dur_min"]) and m["_dur_min"] <= 300)
-        # Kort oppgjorsvindu i et marked som har vaert apent lenge: der ligger
-        # hele avgjorelsen i minuttene rundt event_start, og interval=max
-        # glatter dem bort. Kostnaden er ett ekstra kall, saa bare der volumet
-        # gjor det verdt det.
-        settle = m.get("_settle_min")
-        zoom = None
-        if (pd.notna(settle) and settle <= args.zoom_max_minutes
-                and float(m["volume"] or 0) >= args.zoom_min_volume
-                and pd.notna(m.get("_evt_ts")) and pd.notna(m.get("_end_ts"))):
-            zoom = (int(m["_evt_ts"]) - args.zoom_pad_minutes * 60,
-                    int(m["_end_ts"]) + 300)
         for j, tok in enumerate(json.loads(m["token_ids"])):
             df = fetch_price_history(tok, args.fidelity)
             if df is ERROR:
@@ -655,6 +736,8 @@ def main():
             out.to_parquet(out_dir / f"{mid}.parquet", index=False)
             on_disk_new.add(mid)
             done.add(mid)
+            if zoom and not had_error:
+                zoomdone.add(mid)
             consec_err = 0
         elif had_error:
             # VIKTIG: ikke marker som avklart. Serverfeil != ingen historikk.
@@ -672,14 +755,19 @@ def main():
         if i % 50 == 0:
             save_checkpoint(done)
             save_nohistory(nohist)
-            print(f"  {i}/{len(sel)} sjekket · {zoomed} finkornede vinduer · {len(on_disk_new)} nye prisfiler "
+            save_zoomed(zoomdone)
+            print(f"  {i}/{len(sel)} sjekket · {zoomed} finkornede vinduer "
+                  f"· {backfilled} etterfylte · {len(on_disk_new)} nye prisfiler "
                   f"· {len(nohist)} uten historikk"
                   + (f" · {err_skipped} utsatt pga. serverfeil" if err_skipped else ""),
                   flush=True)
     save_checkpoint(done)
     save_nohistory(nohist)
+    save_zoomed(zoomdone)
     publish(markets)
-    print(f"Ferdig. {len(nohist)} markeder manglet CLOB-historikk."
+    print(f"Ferdig. {len(nohist)} markeder manglet CLOB-historikk. "
+          f"{zoomed} nye markeder fikk finkornet vindu, {backfilled} eldre ble etterfylt "
+          f"({len(zoomdone)} av {len(_z)} kvalifiserte er naa daekket)."
           + (f" {err_skipped} markeder ble utsatt pga. serverfeil og provers neste kjoring."
              if err_skipped else ""))
 
