@@ -29,8 +29,14 @@ on:
       zoom_budget:
         description: "Sekunder til vindus-etterfylling (5400 = 1t30m, 10800 = 3t)"
         default: "5400"
+      max_seconds:
+        description: "Tak for hente-loekka. Publisering + R2-opplasting kommer etter"
+        default: "15300"
       reset_zoom:
         description: "Nullstill vindus-sjekkpunktet forst (true/false)"
+        default: "false"
+      refetch_meta:
+        description: "Tving full metadata-henting (true/false)"
         default: "false"
 
 concurrency:
@@ -75,6 +81,15 @@ jobs:
             --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" || true
           echo "Filer i data/prices etter R2-restore:"
           find data/prices -name '*.parquet' 2>/dev/null | wc -l
+          # Manifestet fra forrige publisering, saa kategorier som ikke endret
+          # seg beholder oppforingen sin uten aa bygges om. Vi henter BARE
+          # manifestet — kategorifilene blir staaende i R2, og sync uten
+          # --delete rorer ikke det som ikke finnes lokalt.
+          mkdir -p data/publish
+          aws s3 cp "s3://hindsight-data/manifest.json" data/publish/manifest.json \
+            --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
+            && echo "Forrige manifest hentet." \
+            || echo "Ingen tidligere manifest — alle kategorier bygges."
 
       # MAA ligge etter begge restore-stegene: cachen henter ellers tilbake fila
       # vi nettopp slettet. Ingest skriver en fersk zoomed.json ved slutten, og
@@ -97,7 +112,10 @@ jobs:
           ARGS="$ARGS --zoom-budget-seconds ${{ inputs.zoom_budget || '5400' }}"
           ARGS="$ARGS --zoom-min-volume ${{ inputs.zoom_min_volume || '250' }}"
           ARGS="$ARGS --zoom-max-minutes ${{ inputs.zoom_max_minutes || '240' }}"
+          ARGS="$ARGS --max-seconds ${{ inputs.max_seconds || '15300' }}"
           if [ -n "${{ inputs.category }}" ]; then ARGS="$ARGS --category ${{ inputs.category }}"; fi
+          if [ "${{ inputs.refetch_meta }}" = "true" ]; then ARGS="$ARGS --refetch-meta"; fi
+          echo "Kjorer med: $ARGS"
           python ingest.py $ARGS
 
       - name: Publish to R2
