@@ -450,13 +450,53 @@ def cross_fill(df):
                .drop_duplicates(subset=["outcome_index", "timestamp"], keep="first"))
 
 
-def publish(markets):
-    """Slaa sammen prisfiler per kategori og legg alt klart for opplasting."""
+SCHEMA = 3
+
+
+def publish(markets, touched=None):
+    """Slaa sammen prisfiler per kategori og legg alt klart for opplasting.
+
+    touched: kategoriene som fikk nye eller endrede prisfiler i denne kjoringen.
+    None betyr "bygg alt" — foerste kjoring, eller naar vi ikke vet.
+
+    Aa bygge alle ni hver gang var i ferd med aa bli det bindende taket: hele
+    settet ble skrevet paa nytt og dermed lastet opp paa nytt, selv naar bare
+    krypto endret seg. Vi trenger ikke hente de gamle filene ned for aa unngaa
+    det — `aws s3 sync` uten --delete rorer ikke det som ikke finnes lokalt, saa
+    en kategori vi hopper over blir staaende urort i R2. Det eneste som maa
+    hentes tilbake er manifest.json, slik at oppfoeringene for de hoppede
+    kategoriene overlever."""
     pub = DATA_DIR / "publish"
     pub.mkdir(exist_ok=True)
+
+    forrige, forrige_schema = {}, None
+    mpath = pub / "manifest.json"
+    if mpath.exists():
+        try:
+            gammelt = json.loads(mpath.read_text())
+            forrige = gammelt.get("categories", {})
+            forrige_schema = gammelt.get("schema")
+        except (json.JSONDecodeError, OSError):
+            pass
+    # Endres formatet, er alt som ligger der utdatert — da bygger vi alt om.
+    if forrige_schema != SCHEMA:
+        if forrige:
+            print(f"  manifest har schema {forrige_schema}, vi skriver {SCHEMA} "
+                  f"— bygger alle kategorier om.", flush=True)
+        touched = None
+
     manifest = {"updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "categories": {}, "schema": 3}
+                "categories": {}, "schema": SCHEMA}
+    hoppet = []
     for catdir in sorted(p for p in PRICES_DIR.iterdir() if p.is_dir()):
+        ferdig = pub / f"prices-{catdir.name}.parquet"
+        if (touched is not None and catdir.name not in touched
+                and catdir.name in forrige):
+            # Uendret: ikke skriv fila, saa har sync ingenting aa laste opp.
+            manifest["categories"][catdir.name] = forrige[catdir.name]
+            hoppet.append(catdir.name)
+            ferdig.unlink(missing_ok=True)
+            continue
         frames = []
         for f in catdir.glob("*.parquet"):
             df = pd.read_parquet(f)
@@ -482,7 +522,9 @@ def publish(markets):
     mk.to_parquet(pub / "markets.parquet", index=False)
     (pub / "manifest.json").write_text(json.dumps(manifest))
     tot = sum(c["rows"] for c in manifest["categories"].values())
-    der = sum(c["derived"] for c in manifest["categories"].values())
+    der = sum(c.get("derived", 0) for c in manifest["categories"].values())
+    if hoppet:
+        print(f"  uendret siden sist, ikke bygget om: {', '.join(hoppet)}", flush=True)
     print(f"Publisert {len(manifest['categories'])} kategorier til data/publish/ "
           f"(schema 3: epoch-kolonner + kryssutfylling). "
           f"{tot:,} rader, herav {der:,} speilet fra motparten "
@@ -505,6 +547,10 @@ def main():
                     help="Maks tid brukt paa aa etterfylle vinduer i markeder som "
                          "allerede har grov historikk (default 1t30m). Resten av "
                          "kjoringen samler nye markeder som vanlig. 0 = av.")
+    ap.add_argument("--refetch-meta", action="store_true",
+                    help="Tving full metadata-henting selv om sjekken sier alt er "
+                         "i orden. Naar en utledet kolonne endrer seg, er dette "
+                         "raskere enn aa lure paa om selvhelbredelsen traff.")
     ap.add_argument("--category", default=None)
     ap.add_argument("--min-volume", type=float, default=0)
     ap.add_argument("--short-min-volume", type=float, default=200,
@@ -519,8 +565,12 @@ def main():
     ap.add_argument("--tag-backfill-days", type=int, default=300,
                     help="Ved manglende tags: hent metadata bare saa langt tilbake. "
                          "Eldre markeder har uansett ingen prishistorikk i CLOB.")
-    ap.add_argument("--max-seconds", type=int, default=18900,
-                    help="Avslutt pent etter saa mange sekunder (default 5t15m)")
+    ap.add_argument("--max-seconds", type=int, default=15300,
+                    help="Avslutt hentingen pent etter saa mange sekunder "
+                         "(default 4t15m). MERK at dette bare styrer hente-loekka: "
+                         "publish() og opplastingen til R2 kommer ETTER, og de "
+                         "vokser med datasettet. Med 5t15m her ble jobben drept "
+                         "midt i opplastingen av jobbens egen timeout paa 5t50m.")
     args = ap.parse_args()
     t0 = time.monotonic()
 
@@ -545,13 +595,25 @@ def main():
         # Naa leses vinduet ut av spoersmaalsteksten i stedet, og da maa radene
         # hentes paa nytt. Sjekker vi bare at kolonnen er der, sier den "alt i
         # orden" mens 130 000 markeder blir staaende tomme for alltid.
-        evt_ok = False
+        evt_ok, evt_share = False, 1.0
         if has_evt:
             ud = markets["question"].astype(str).str.contains(
                 "up or down", case=False, na=False)
-            evt_ok = (not ud.any()) or \
-                markets.loc[ud, "event_start"].notna().mean() > 0.5
-        if filled > 0.5 and has_evt and evt_ok:
+            if not ud.any():
+                evt_ok = True
+            else:
+                # notna() duger ikke: Gamma sender tom streng, og
+                # `m.get("eventStartTime") or m.get("gameStartTime")` gir da ""
+                # og ikke None. Tomme strenger er notna()==True, saa sjekken sa
+                # "100 % utfylt" om en kolonne uten et eneste brukbart tidspunkt.
+                # Test derfor om verdien lar seg TOLKE som en dato.
+                evt_share = pd.to_datetime(
+                    markets.loc[ud, "event_start"],
+                    errors="coerce", utc=True).notna().mean()
+                evt_ok = evt_share > 0.5
+        if args.refetch_meta:
+            print("--refetch-meta satt — henter metadata paa nytt uansett.")
+        elif filled > 0.5 and has_evt and evt_ok:
             meta_ok = True
             print(f"Bruker komplett metadata: {len(markets)} markeder "
                   f"({filled*100:.0f} % med tags)")
@@ -559,8 +621,9 @@ def main():
             print("Metadata mangler kolonnen event_start (det ekte handelsvinduet) "
                   "— henter paa nytt.")
         elif not evt_ok:
-            print("event_start er tom for Up-or-Down-familien — henter paa nytt "
-                  "saa vinduet kan utledes fra spoersmaalsteksten.")
+            print(f"event_start lar seg tolke for bare {evt_share*100:.1f} % av "
+                  f"Up-or-Down-markedene — henter paa nytt saa vinduet kan "
+                  f"utledes fra spoersmaalsteksten.")
         else:
             print(f"Metadata har tags paa bare {filled*100:.1f} % av radene — "
                   f"henter alt paa nytt med include_tag=true.")
@@ -730,7 +793,11 @@ def main():
         save_checkpoint(done)
         save_nohistory(nohist)
         save_zoomed(zoomdone)
-        publish(markets)
+        t_pub = time.monotonic()
+        publish(markets, touched)
+        print(f"Henting {(t_pub - t0)/60:.0f} min · publisering "
+              f"{(time.monotonic() - t_pub)/60:.0f} min. Opplastingen til R2 "
+              f"kommer i tillegg — se at jobben har tid igjen.", flush=True)
         print(f"Tidsbudsjett naadd — lagrer og avslutter pent. "
               f"({len(done)}/{len(sel)} avklart, {len(nohist)} uten historikk totalt"
               + (f", {err_skipped} utsatt pga. serverfeil" if err_skipped else "") + ")", flush=True)
@@ -738,6 +805,7 @@ def main():
     zoomed = 0
     backfilled = 0
     bad_window = 0
+    touched = set()   # kategorier som fikk nye eller endrede prisfiler
     zoom_tries = 0
     zoom_spent = 0.0
     for i, (_, m) in enumerate(sel.iterrows(), 1):
@@ -793,6 +861,7 @@ def main():
                 out_dir = PRICES_DIR / m["category"]
                 out_dir.mkdir(exist_ok=True)
                 merge_price_file(out_dir / f"{mid}.parquet", zframes)
+                touched.add(m["category"])
                 on_disk_new.add(mid)
                 nohist.discard(mid)   # vinduet fant det interval=max ikke gjorde
                 backfilled += 1
@@ -851,6 +920,7 @@ def main():
                       .drop_duplicates(subset=["outcome_index", "timestamp"], keep="first")
                       .sort_values(["outcome_index", "timestamp"]))
             out.to_parquet(out_dir / f"{mid}.parquet", index=False)
+            touched.add(m["category"])
             on_disk_new.add(mid)
             done.add(mid)
             if zoom and not had_error:
@@ -881,7 +951,10 @@ def main():
     save_checkpoint(done)
     save_nohistory(nohist)
     save_zoomed(zoomdone)
-    publish(markets)
+    t_pub = time.monotonic()
+    publish(markets, touched)
+    print(f"Henting {(t_pub - t0)/60:.0f} min · publisering {(time.monotonic() - t_pub)/60:.0f} min "
+          f"· {(args.max_seconds - (t_pub - t0))/60:.0f} min av budsjettet ubrukt", flush=True)
     print(f"Ferdig. {len(nohist)} markeder manglet CLOB-historikk. "
           f"{zoomed} nye markeder fikk finkornet vindu, {backfilled} eldre ble etterfylt "
           f"({len(zoomdone)} av {len(_z)} kvalifiserte er naa daekket)."
