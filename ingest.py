@@ -166,6 +166,49 @@ def get_json(url, params=None, attempts=5):
     return ERROR
 
 
+WINDOW_RE = _re.compile(
+    r"(\d{1,2})(?::(\d{2}))?\s*([AP])M\s*[-\u2013]\s*(\d{1,2})(?::(\d{2}))?\s*([AP])M",
+    _re.I)
+
+
+def window_minutes(question):
+    """'Bitcoin Up or Down - June 14, 4:50PM-4:55PM ET' -> 5.
+
+    Gamma gir ikke eventStartTime for Up-or-Down-familien (0 av 191 727), men
+    handelsvinduet staar i selve spoersmaalet. Vi leser bare DIFFERANSEN mellom
+    de to klokkeslettene, ikke tidspunktene — da slipper vi baade tidssone og
+    sommertid, siden end_date allerede er vindusslutt.
+
+    Returnerer None naar spoersmaalet ikke har et vindu (dognmarkeder o.l.)."""
+    hit = WINDOW_RE.search(question or "")
+    if not hit:
+        return None
+
+    def as_minutes(h, mm, ap):
+        return (int(h) % 12 + (12 if ap.upper() == "P" else 0)) * 60 + int(mm or 0)
+
+    a = as_minutes(hit.group(1), hit.group(2), hit.group(3))
+    b = as_minutes(hit.group(4), hit.group(5), hit.group(6))
+    span = b - a
+    if span <= 0:
+        span += 1440          # vinduet krysser midnatt: 11:55PM-12:00AM
+    return span if span <= 1440 else None
+
+
+def event_start_for(m):
+    """eventStartTime naar Gamma har den, ellers utledet fra spoersmaalsteksten."""
+    stated = m.get("eventStartTime") or m.get("gameStartTime")
+    if stated:
+        return stated
+    span = window_minutes(m.get("question"))
+    if not span or not m.get("endDate"):
+        return None
+    end = pd.to_datetime(m["endDate"], errors="coerce", utc=True)
+    if pd.isna(end):
+        return None
+    return (end - pd.Timedelta(minutes=span)).isoformat()
+
+
 def parse_market(m):
     token_ids = m.get("clobTokenIds")
     if isinstance(token_ids, str):
@@ -190,8 +233,10 @@ def parse_market(m):
         "start_date": m.get("startDate"),
         # Det EKTE handelsvinduet. startDate er naar markedet ble opprettet — for
         # "Bitcoin Up or Down - 6:15PM-6:20PM" er den et dogn for oppgjor, saa
-        # varighet regnet fra start_date blir 1430 min i stedet for 5.
-        "event_start": m.get("eventStartTime") or m.get("gameStartTime"),
+        # varighet regnet fra start_date blir 1430 min i stedet for 5. Gamma gir
+        # ikke eventStartTime for den familien i det hele tatt, saa vinduet leses
+        # ut av spoersmaalsteksten naar feltet mangler.
+        "event_start": event_start_for(m),
         "end_date": m.get("endDate"),
         "volume": float(m.get("volumeNum") or m.get("volume") or 0),
         "liquidity": float(m.get("liquidityNum") or m.get("liquidity") or 0),
@@ -407,8 +452,10 @@ def main():
     ap.add_argument("--zoom-max-minutes", type=int, default=60,
                     help="Hent ekstra finkornet vindu naar oppgjorsvinduet er "
                          "kortere enn dette (0 = av).")
-    ap.add_argument("--zoom-min-volume", type=float, default=5000,
-                    help="Bare for markeder over dette volumet — ett ekstra kall hver.")
+    ap.add_argument("--zoom-min-volume", type=float, default=250,
+                    help="Bare for markeder over dette volumet — ett ekstra kall "
+                         "hver. Medianen i den rene femminutters-klassen er $881, "
+                         "saa $5000 sperret ute det meste av det vi er ute etter.")
     ap.add_argument("--zoom-pad-minutes", type=int, default=15,
                     help="Hvor lenge for event_start vinduet skal begynne.")
     ap.add_argument("--zoom-budget-seconds", type=int, default=5400,
