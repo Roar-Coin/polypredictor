@@ -35,5 +35,4 @@ jobs:
             --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
       - name: Kjor probe
-        run: python probe_retention.py
-
+        run: python probe_shortmarkets.py
