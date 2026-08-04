@@ -497,13 +497,27 @@ def main():
         # trenger, hentes metadata paa nytt av seg selv. Aa maatte huske aa slette
         # meta_complete.flag manuelt er en feil som skjer stille.
         has_evt = "event_start" in markets.columns
-        if filled > 0.5 and has_evt:
+        # Samme lekse en gang til: kolonnen fantes fra 2. august, men var NaN for
+        # HELE Up-or-Down-familien, fordi Gamma ikke sender eventStartTime for den.
+        # Naa leses vinduet ut av spoersmaalsteksten i stedet, og da maa radene
+        # hentes paa nytt. Sjekker vi bare at kolonnen er der, sier den "alt i
+        # orden" mens 130 000 markeder blir staaende tomme for alltid.
+        evt_ok = False
+        if has_evt:
+            ud = markets["question"].astype(str).str.contains(
+                "up or down", case=False, na=False)
+            evt_ok = (not ud.any()) or \
+                markets.loc[ud, "event_start"].notna().mean() > 0.5
+        if filled > 0.5 and has_evt and evt_ok:
             meta_ok = True
             print(f"Bruker komplett metadata: {len(markets)} markeder "
                   f"({filled*100:.0f} % med tags)")
         elif not has_evt:
             print("Metadata mangler kolonnen event_start (det ekte handelsvinduet) "
                   "— henter paa nytt.")
+        elif not evt_ok:
+            print("event_start er tom for Up-or-Down-familien — henter paa nytt "
+                  "saa vinduet kan utledes fra spoersmaalsteksten.")
         else:
             print(f"Metadata har tags paa bare {filled*100:.1f} % av radene — "
                   f"henter alt paa nytt med include_tag=true.")
