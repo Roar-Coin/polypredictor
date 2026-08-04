@@ -20,6 +20,9 @@ on:
       zoom_min_volume:
         description: "Volumgulv for finkornet vindus-kall"
         default: "250"
+      zoom_max_minutes:
+        description: "Maks oppgjorsvindu som gir finkornet kall (240 = tar med 4-timers)"
+        default: "240"
       since_days:
         description: "Hent markeder avsluttet siste N dager (0 = alle)"
         default: "180"
@@ -93,6 +96,7 @@ jobs:
           ARGS="$ARGS --since-days ${{ inputs.since_days || '180' }}"
           ARGS="$ARGS --zoom-budget-seconds ${{ inputs.zoom_budget || '5400' }}"
           ARGS="$ARGS --zoom-min-volume ${{ inputs.zoom_min_volume || '250' }}"
+          ARGS="$ARGS --zoom-max-minutes ${{ inputs.zoom_max_minutes || '240' }}"
           if [ -n "${{ inputs.category }}" ]; then ARGS="$ARGS --category ${{ inputs.category }}"; fi
           python ingest.py $ARGS
 
