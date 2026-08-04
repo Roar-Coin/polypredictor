@@ -16,7 +16,10 @@ on:
         default: ""
       min_volume:
         description: "Min. volum i USD"
-        default: "1000"
+        default: "250"
+      zoom_min_volume:
+        description: "Volumgulv for finkornet vindus-kall"
+        default: "250"
       since_days:
         description: "Hent markeder avsluttet siste N dager (0 = alle)"
         default: "180"
@@ -89,6 +92,7 @@ jobs:
           ARGS="--fidelity ${{ inputs.fidelity || '60' }} --min-volume ${{ inputs.min_volume || '1000' }}"
           ARGS="$ARGS --since-days ${{ inputs.since_days || '180' }}"
           ARGS="$ARGS --zoom-budget-seconds ${{ inputs.zoom_budget || '5400' }}"
+          ARGS="$ARGS --zoom-min-volume ${{ inputs.zoom_min_volume || '250' }}"
           if [ -n "${{ inputs.category }}" ]; then ARGS="$ARGS --category ${{ inputs.category }}"; fi
           python ingest.py $ARGS
 
@@ -113,4 +117,3 @@ jobs:
         with:
           path: data
           key: poly-data-${{ github.run_id }}
-
