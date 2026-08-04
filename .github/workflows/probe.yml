@@ -1,0 +1,47 @@
+# .github/workflows/probe.yml
+# Engangsprober. Bytt scriptnavnet i siste steg etter behov.
+# Henter KUN metadata + checkpoint — ikke prisfilene, som er titusenvis av
+# smaa parquet-filer og tar en halvtime aa synce.
+
+name: probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      script:
+        description: "Hvilken probe (uten .py)"
+        default: "probe_updown"
+
+env:
+  R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install --quiet requests pandas pyarrow awscli
+
+      - name: Hent metadata og sjekkpunkt fra R2
+        run: |
+          mkdir -p data
+          EP="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3 cp "s3://hindsight-data/raw/markets.parquet" data/markets.parquet --endpoint-url "$EP"
+          aws s3 cp "s3://hindsight-data/raw/checkpoint.json" data/checkpoint.json --endpoint-url "$EP" || \
+            echo "checkpoint.json ikke funnet — 'har prisfil' blir tomt."
+          aws s3 cp "s3://hindsight-data/raw/nohistory.json" data/nohistory.json --endpoint-url "$EP" || true
+          ls -la data/
+
+      - name: Kjor probe
+        run: python ${{ inputs.script || 'probe_updown' }}.py
