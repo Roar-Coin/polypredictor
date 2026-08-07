@@ -6,6 +6,7 @@ og hopper over markeder uten CLOB-historikk med tydelig logging.
 
 import argparse
 import json
+import os
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -353,24 +354,62 @@ def fetch_price_history(token_id, fidelity, window=None):
     return df.rename(columns={"t": "timestamp", "p": "price"})
 
 
+def _save_id_set(path, ids):
+    """Skriv en id-liste atomisk: fullfor til .tmp, bytt deretter navn.
+
+    write_text er IKKE atomisk. Blir jobben drept midt i skrivingen — slik
+    GitHub gjorde 6. august — ligger det igjen en avkortet fil, den synkes til
+    R2, og neste kjoring krasjer paa den for den rekker aa gjore noe.
+    os.replace er atomisk paa samme filsystem: enten ser du hele den gamle
+    fila eller hele den nye, aldri en halv."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(sorted(ids)))
+    os.replace(tmp, path)
+
+
+def _load_id_set(path, navn):
+    """Les en id-liste, og berg det som berges kan hvis fila er avkortet.
+
+    En avkortet liste av tekststrenger kan reddes: alt fram til den siste
+    komplette oppforingen er gyldig, vi lukker klammen selv. Aa starte fra
+    tomt i stedet ville betydd titusenvis av unodvendige kall om igjen."""
+    if not path.exists():
+        return set()
+    tekst = path.read_text()
+    try:
+        return set(json.loads(tekst))
+    except json.JSONDecodeError as e:
+        kutt = tekst.rfind('",')
+        if kutt != -1:
+            try:
+                berget = json.loads(tekst[:kutt + 1] + "]")
+                print(f"  !! {navn} var avkortet ({e}) — berget "
+                      f"{len(berget)} oppforinger og skriver den hel igjen.",
+                      flush=True)
+                _save_id_set(path, berget)
+                return set(berget)
+            except json.JSONDecodeError:
+                pass
+        print(f"  !! {navn} er odelagt og lot seg ikke berge — starter tom. "
+              f"Arbeid kan bli gjort om igjen, men ingenting gaar tapt.",
+              flush=True)
+        return set()
+
+
 def load_checkpoint():
-    if CHECKPOINT.exists():
-        return set(json.loads(CHECKPOINT.read_text()))
-    return set()
+    return _load_id_set(CHECKPOINT, "checkpoint.json")
 
 
 def save_checkpoint(done):
-    CHECKPOINT.write_text(json.dumps(sorted(done)))
+    _save_id_set(CHECKPOINT, done)
 
 
 def load_nohistory():
-    if NOHISTORY.exists():
-        return set(json.loads(NOHISTORY.read_text()))
-    return set()
+    return _load_id_set(NOHISTORY, "nohistory.json")
 
 
 def save_nohistory(nohist):
-    NOHISTORY.write_text(json.dumps(sorted(nohist)))
+    _save_id_set(NOHISTORY, nohist)
 
 
 def load_zoomed():
@@ -379,13 +418,11 @@ def load_zoomed():
     Egen liste fordi `checkpoint.json` betyr 'grov historikk hentet'. Uten
     dette skillet hopper loekka over hvert eneste marked som ble hentet for
     vindus-kallet fantes — som er nettopp de vi vil ha finkornet."""
-    if ZOOMED.exists():
-        return set(json.loads(ZOOMED.read_text()))
-    return set()
+    return _load_id_set(ZOOMED, "zoomed.json")
 
 
 def save_zoomed(zoomdone):
-    ZOOMED.write_text(json.dumps(sorted(zoomdone)))
+    _save_id_set(ZOOMED, zoomdone)
 
 
 def merge_price_file(path, frames):
