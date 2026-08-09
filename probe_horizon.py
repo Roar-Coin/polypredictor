@@ -1,36 +1,34 @@
 #!/usr/bin/env python3
-"""probe_horizon.py — hvor langt tilbake kan vinduskall bygge arkivet?
+"""probe_horizon.py v2 — hvor langt tilbake kan vinduskall bygge arkivet?
 
-`--since-days 180` kutter alt som ble avsluttet for ca. 9. februar, og loggen
-skriver «eldre historikk finnes ikke i API-et». Den paastanden ble maalt med
-`interval=max` — nettopp kallet probe_retention viste at doer med alder mens
-vinduskallet ikke gjor det. Up-or-Down-familien gaar tilbake til mai 2025.
+v1 filtrerte paa femminuttersmarkeder og fant at de bare finnes fra 27. mai
+2026. Riktig svar paa feil sporsmaal: den serien er ti uker gammel, saa det
+finnes ikke noe eldre femminuttersarkiv aa hente.
 
-Proben svarer paa to ting:
+Det som betyr noe er VAeR. Det er den eneste kandidaten som klarer
+klyngegulvet, og den klarer det med +0,3 pp margin — den trenger flere
+klynger, ikke flere handler. En klynge er by + dag, saa hvert ekstra dogn med
+vaerarkiv er direkte det den mangler.
 
-  1. VIRKER DET? Samme vinduskall mot femminuttersmarkeder i aldersbaand fra
-     180 til 500 dogn. probe_retention testet bare til 62 dogn.
-  2. ER DET VERDT DET? Hvor mange markeder ligger i hvert baand over
-     volumgulvet, og hvor lang tid ville hentingen ta.
+`--since-days 180` kutter alt eldre enn ca. 9. februar, begrunnet med at
+«eldre historikk finnes ikke i API-et». Den paastanden ble maalt med
+`interval=max`. probe_retention viste at vinduskall lever der interval=max
+doer. Denne proben tester det paa vaer, og paa alle andre kategorier.
 
-Et vinduskall som gir punkter MED prisvariasjon er ekte data. Gir det punkter
-uten variasjon, er serien baaret fremover fra ingenting og verdilos. Derfor
-telles bade punkter og antall ULIKE priser.
-
-Kjores med probe.yml, script=probe_horizon.
+Punkter alene beviser ingenting: CLOB fyller hele det etterspurte vinduet med
+ett punkt per minutt uansett. Bare ULIKE priser er bevis paa ekte handel.
 """
 import json
 import sys
 import pandas as pd
 
-from ingest import (fetch_price_history, window_minutes, load_checkpoint,
-                    DATA_DIR, ERROR)
+from ingest import fetch_price_history, load_checkpoint, DATA_DIR, ERROR
 
-PAD_MIN = 15
-PER_BUCKET = 6
+LOOKBACK_H = 12       # timer for end_date vi ber om
+PER_BUCKET = 5
 MIN_VOLUME = 250
-BUCKETS = [(150, 180), (180, 210), (210, 240), (240, 300),
-           (300, 360), (360, 420), (420, 500)]
+BUCKETS = [(150, 180), (180, 210), (210, 270), (270, 365), (365, 500), (500, 800)]
+KATEGORIER = ["weather", "sports", "crypto", "politics"]
 
 
 def main():
@@ -41,92 +39,101 @@ def main():
     mk = pd.read_parquet(path)
     now = pd.Timestamp.now(tz="UTC")
     end = pd.to_datetime(mk["end_date"], errors="coerce", utc=True)
-    span = mk["question"].astype(str).map(window_minutes)
-
     done = load_checkpoint()
-    ud = mk.assign(
+
+    mk = mk.assign(
         _end=end,
-        _span=span,
         _alder=(now - end).dt.total_seconds() / 86400,
+        _har_fil=mk["market_id"].astype(str).isin(done),
     )
-    ud = ud[(ud["_span"] == 5) & ud["_end"].notna()]
-    ud = ud.assign(_har_fil=ud["market_id"].astype(str).isin(done))
+    mk = mk[mk["_end"].notna() & (mk["_alder"] > 0)
+            & (mk["volume"] >= MIN_VOLUME)
+            & mk["resolved_outcome"].notna()]
 
-    print(f"{len(ud):,} femminuttersmarkeder i metadata, "
-          f"{ud['_end'].min():%Y-%m-%d} → {ud['_end'].max():%Y-%m-%d}\n")
+    print(f"{len(mk):,} avgjorte markeder over ${MIN_VOLUME} · "
+          f"{mk['_end'].min():%Y-%m-%d} → {mk['_end'].max():%Y-%m-%d}\n")
 
-    print("=" * 88)
-    print("1. HVA LIGGER DER — markeder per aldersbaand\n")
-    print(f"{'alder (dogn)':>14} {'markeder':>10} {'over $250':>11} "
-          f"{'har fil':>9} {'median volum':>13}")
-    print("-" * 88)
+    print("=" * 92)
+    print("1. HVA LIGGER UTENFOR 180-DAGERSGRENSEN\n")
+    print(f"{'alder (dogn)':>14} " + "".join(f"{k:>12}" for k in KATEGORIER)
+          + f"{'har fil':>10}")
+    print("-" * 92)
     utsikter = {}
     for lo, hi in BUCKETS:
-        sub = ud[(ud["_alder"] >= lo) & (ud["_alder"] < hi)]
+        sub = mk[(mk["_alder"] >= lo) & (mk["_alder"] < hi)]
         if sub.empty:
             continue
-        over = sub[sub["volume"] >= MIN_VOLUME]
-        utsikter[(lo, hi)] = len(over)
-        print(f"{f'{lo}-{hi}':>14} {len(sub):>10,} {len(over):>11,} "
-              f"{sub['_har_fil'].sum():>9,} ${sub['volume'].median():>12,.0f}")
+        rad = [len(sub[sub["category"] == k]) for k in KATEGORIER]
+        utsikter[(lo, hi)] = dict(zip(KATEGORIER, rad))
+        utsikter[(lo, hi)]["_alle"] = len(sub)
+        print(f"{f'{lo}-{hi}':>14} " + "".join(f"{n:>12,}" for n in rad)
+              + f"{sub['_har_fil'].sum():>10,}")
 
-    print("\n" + "=" * 88)
-    print("2. VIRKER VINDUSKALLET SAA LANGT TILBAKE?\n")
-    print(f"{'alder':>7} {'marked':<44} {'volum':>9} {'punkter':>8} {'priser':>7}")
-    print("-" * 88)
+    print("\n" + "=" * 92)
+    print(f"2. VIRKER VINDUSKALLET? Siste {LOOKBACK_H} t for oppgjor, "
+          f"fidelity=1\n")
+    print(f"{'alder':>7} {'kat':<9} {'marked':<40} {'volum':>10} "
+          f"{'punkt':>7} {'priser':>7}")
+    print("-" * 92)
 
     dom = {}
     for lo, hi in BUCKETS:
-        sub = ud[(ud["_alder"] >= lo) & (ud["_alder"] < hi)
-                 & (ud["volume"] >= MIN_VOLUME)]
+        sub = mk[(mk["_alder"] >= lo) & (mk["_alder"] < hi)]
         if sub.empty:
             continue
-        sub = sub.nlargest(PER_BUCKET, "volume")
-        levende = 0
-        for _, m in sub.iterrows():
+        # Vaer forst, saa de storste uansett kategori
+        utvalg = pd.concat([
+            sub[sub["category"] == "weather"].nlargest(PER_BUCKET // 2 + 1, "volume"),
+            sub.nlargest(PER_BUCKET, "volume"),
+        ]).drop_duplicates(subset="market_id").head(PER_BUCKET + 1)
+
+        levende = testet = 0
+        for _, m in utvalg.iterrows():
             toks = json.loads(m["token_ids"])
             if not toks:
                 continue
             end_ts = int(m["_end"].timestamp())
             df = fetch_price_history(
-                toks[0], 1, window=(end_ts - (5 + PAD_MIN) * 60, end_ts + 300))
-            q = str(m["question"])[:44]
+                toks[0], 1, window=(end_ts - LOOKBACK_H * 3600, end_ts + 300))
+            testet += 1
+            q = str(m["question"])[:40]
             if df is ERROR or df is None or df.empty:
-                print(f"{m['_alder']:>7.0f} {q:<44} {m['volume']:>9,.0f} "
-                      f"{'tom':>8}")
+                print(f"{m['_alder']:>7.0f} {str(m['category']):<9} {q:<40} "
+                      f"{m['volume']:>10,.0f} {'tom':>7}")
                 continue
             priser = df["price"].nunique()
-            # Ett punkt per minutt uten variasjon er en baaret serie, ikke data.
-            if priser > 1:
-                levende += 1
-            print(f"{m['_alder']:>7.0f} {q:<44} {m['volume']:>9,.0f} "
-                  f"{len(df):>8} {priser:>7}")
-        dom[(lo, hi)] = (levende, len(sub))
+            levende += priser > 1
+            print(f"{m['_alder']:>7.0f} {str(m['category']):<9} {q:<40} "
+                  f"{m['volume']:>10,.0f} {len(df):>7} {priser:>7}")
+        dom[(lo, hi)] = (levende, testet)
         print()
 
-    print("=" * 88)
-    print(f"{'alder':>12} {'ekte data':>11} {'markeder over $250':>20}   tolkning")
-    total_verdt = 0
+    print("=" * 92)
+    print(f"{'alder':>12} {'ekte data':>11} {'vaer':>8} {'alle':>10}   tolkning")
+    vaer_sum = alle_sum = 0
     for (lo, hi), (levende, testet) in dom.items():
-        n = utsikter.get((lo, hi), 0)
+        u = utsikter.get((lo, hi), {})
         if levende == 0:
             tolkning = "tomt — grensen gaar her"
         elif levende < testet:
-            tolkning = "delvis — ujevn dekning"
+            tolkning = "delvis dekning"
         else:
             tolkning = "full dekning"
-            total_verdt += n
-        print(f"{f'{lo}-{hi}d':>12} {f'{levende}/{testet}':>11} {n:>20,}   {tolkning}")
+            vaer_sum += u.get("weather", 0)
+            alle_sum += u.get("_alle", 0)
+        print(f"{f'{lo}-{hi}d':>12} {f'{levende}/{testet}':>11} "
+              f"{u.get('weather', 0):>8,} {u.get('_alle', 0):>10,}   {tolkning}")
 
-    if total_verdt:
-        timer = total_verdt * 2 * 0.36 / 3600
-        print(f"\n{total_verdt:,} markeder ligger i baand med full dekning. "
-              f"Aa hente dem tar ~{timer:.1f} t, altsaa ~{timer/3:.0f} kjoringer "
-              f"med 3-timers vindusbudsjett.")
-        print("Sett --since-days deretter. Husk at det ogsaa utvider den "
-              "generelle koen, ikke bare vindus-koen.")
+    if alle_sum:
+        print(f"\nI baand med full dekning ligger {vaer_sum:,} vaermarkeder "
+              f"og {alle_sum:,} totalt.")
+        print(f"Aa hente alt tar ~{alle_sum * 2 * 0.36 / 3600:.0f} t; "
+              f"bare vaer tar ~{vaer_sum * 2 * 0.36 / 3600:.1f} t "
+              f"(--category weather).")
+        print("Vaer alene er den billige veien: kandidaten trenger klynger, "
+              "og hver ny bydag er en ny klynge.")
     else:
-        print("\nIngen baand ga ekte data. 180-dagersgrensen staar.")
+        print("\nIngen baand ga ekte data. 180-dagersgrensen staar som den er.")
 
 
 if __name__ == "__main__":
