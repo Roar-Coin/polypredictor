@@ -22,9 +22,18 @@ on:
       zoom_max_minutes:
         description: "Maks oppgjorsvindu som gir finkornet kall (240 = tar med 4-timers)"
         default: "240"
+      refresh_days:
+        description: "Metadata-oppdatering: hvor mange dager tilbake (60 = normalt, 10 under innhenting)"
+        default: "60"
       since_days:
         description: "Hent markeder avsluttet siste N dager (0 = alle)"
         default: "180"
+      rescue_hours:
+        description: "Redde markeder uten historikk: timer for oppgjor (0 = av)"
+        default: "12"
+      rescue_budget:
+        description: "Sekunder til redningsforsok per kjoring"
+        default: "3600"
       zoom_budget:
         description: "Sekunder til vindus-etterfylling (5400 = 1t30m, 10800 = 3t)"
         default: "10800"
@@ -112,6 +121,9 @@ jobs:
           ARGS="$ARGS --zoom-min-volume ${{ inputs.zoom_min_volume || '250' }}"
           ARGS="$ARGS --zoom-max-minutes ${{ inputs.zoom_max_minutes || '240' }}"
           ARGS="$ARGS --max-seconds ${{ inputs.max_seconds || '15300' }}"
+          ARGS="$ARGS --rescue-hours ${{ inputs.rescue_hours || '12' }}"
+          ARGS="$ARGS --rescue-budget-seconds ${{ inputs.rescue_budget || '3600' }}"
+          ARGS="$ARGS --refresh-days ${{ inputs.refresh_days || '60' }}"
           if [ -n "${{ inputs.category }}" ]; then ARGS="$ARGS --category ${{ inputs.category }}"; fi
           if [ "${{ inputs.refetch_meta }}" = "true" ]; then ARGS="$ARGS --refetch-meta"; fi
           echo "Kjorer med: $ARGS"
@@ -138,3 +150,4 @@ jobs:
         with:
           path: data
           key: poly-data-${{ github.run_id }}
+
