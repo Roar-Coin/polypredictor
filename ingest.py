@@ -22,6 +22,7 @@ PRICES_DIR = DATA_DIR / "prices"
 CHECKPOINT = DATA_DIR / "checkpoint.json"
 NOHISTORY = DATA_DIR / "nohistory.json"
 ZOOMED = DATA_DIR / "zoomed.json"
+RESCUED = DATA_DIR / "rescued.json"
 META_DONE = DATA_DIR / "meta_complete.flag"
 
 ERROR = object()   # skiller "API-et feilet" fra "API-et sa: ingen data"
@@ -425,6 +426,24 @@ def save_zoomed(zoomdone):
     _save_id_set(ZOOMED, zoomdone)
 
 
+def load_rescued():
+    """Markeder vi har forsokt aa redde med et vinduskall.
+
+    `nohistory.json` betyr «interval=max ga ingenting» — og det kallet doer med
+    alder. probe_horizon viste at vinduskall lever der: London paa 460 dogn ga
+    34 ulike priser, NYC paa 461 dogn ga 125. Dataene finnes altsaa, vi har bare
+    aldri spurt etter dem for disse markedene. Vaermarkeder rammes hardest,
+    fordi de mangler event_start helt og dermed aldri kvalifiserer til
+    vindus-kallet.
+
+    Egen liste saa et mislykket forsok ikke gjentas hver eneste kjoring."""
+    return _load_id_set(RESCUED, "rescued.json")
+
+
+def save_rescued(rescued):
+    _save_id_set(RESCUED, rescued)
+
+
 def merge_price_file(path, frames):
     """Legg nye barer inn i en eksisterende prisfil. Finest fidelity vinner."""
     if path.exists():
@@ -578,12 +597,26 @@ def main():
                     help="Bare for markeder over dette volumet — ett ekstra kall "
                          "hver. Medianen i den rene femminutters-klassen er $881, "
                          "saa $5000 sperret ute det meste av det vi er ute etter.")
+    ap.add_argument("--rescue-hours", type=int, default=12,
+                    help="Prov aa hente markeder uten historikk med et vinduskall "
+                         "over de siste N timene for oppgjor (0 = av). Rammer "
+                         "saerlig vaer, som mangler event_start og derfor aldri "
+                         "kvalifiserer til det vanlige vindus-kallet.")
+    ap.add_argument("--rescue-min-volume", type=float, default=250,
+                    help="Volumgulv for redningsforsok.")
+    ap.add_argument("--rescue-budget-seconds", type=int, default=3600,
+                    help="Maks tid brukt paa redningsforsok per kjoring.")
     ap.add_argument("--zoom-pad-minutes", type=int, default=15,
                     help="Hvor lenge for event_start vinduet skal begynne.")
     ap.add_argument("--zoom-budget-seconds", type=int, default=5400,
                     help="Maks tid brukt paa aa etterfylle vinduer i markeder som "
                          "allerede har grov historikk (default 1t30m). Resten av "
                          "kjoringen samler nye markeder som vanlig. 0 = av.")
+    ap.add_argument("--refresh-days", type=int, default=60,
+                    help="Hvor langt tilbake den inkrementelle metadata-"
+                         "oppdateringen gaar. 60 fanger sene oppgjor, men koster "
+                         "timer per kjoring. Sett lavt under innhenting, tilbake "
+                         "til 60 naar den er ferdig.")
     ap.add_argument("--refetch-meta", action="store_true",
                     help="Tving full metadata-henting selv om sjekken sier alt er "
                          "i orden. Naar en utledet kolonne endrer seg, er dette "
@@ -665,10 +698,18 @@ def main():
             print(f"Metadata har tags paa bare {filled*100:.1f} % av radene — "
                   f"henter alt paa nytt med include_tag=true.")
     if meta_ok:
-        # Inkrementell oppdatering: refetch siste 60 dager (nye markeder + endelige utfall)
-        cutoff = (date.today() - timedelta(days=60)).isoformat() + "T00:00:00Z"
+        # Inkrementell oppdatering: nye markeder OG utfall som ble avgjort etter at
+        # markedet stengte. Vinduet maa vaere bredt nok til aa fange sene oppgjor —
+        # et marked uten resolved_outcome faller ut av backtestene — men bredden er
+        # dyr: 60 dager betyr ~460 000 markeder hentet paa nytt for aa finne under
+        # 200 nye. Under en innhenting er den tiden bedre brukt paa prishistorikk,
+        # saa vinduet kan strammes midlertidig og settes tilbake etterpaa.
+        t_meta = time.monotonic()
+        cutoff = (date.today() - timedelta(days=args.refresh_days)).isoformat() + "T00:00:00Z"
         horizon = (date.today() + timedelta(days=2)).isoformat() + "T00:00:00Z"
         fresh = fetch_window(cutoff, horizon)
+        print(f"Metadata-vindu: siste {args.refresh_days} dager, "
+              f"brukte {(time.monotonic() - t_meta)/60:.0f} min", flush=True)
         if fresh:
             fresh_df = pd.DataFrame(fresh).drop_duplicates(subset="market_id")
             n_new = len(set(fresh_df["market_id"]) - set(markets["market_id"]))
@@ -825,11 +866,17 @@ def main():
     print(f"Koe: {pending} av {len(sel)} markeder i vinduet gjenstaar aa sjekke", flush=True)
     print(f"Vindus-koe: {zoom_pending} av {len(_z)} kvalifiserte mangler finkornet vindu "
           f"(budsjett {args.zoom_budget_seconds}s for etterfylling)", flush=True)
+    if args.rescue_hours > 0:
+        _r = sum(1 for x in sel["market_id"].astype(str)
+                 if x in nohist and x not in load_rescued())
+        print(f"Rednings-koe: {_r} markeder uten historikk er ikke provd med "
+              f"vinduskall enda (budsjett {args.rescue_budget_seconds}s)", flush=True)
 
     def stop_cleanly():
         save_checkpoint(done)
         save_nohistory(nohist)
         save_zoomed(zoomdone)
+        save_rescued(rescued)
         t_pub = time.monotonic()
         publish(markets, touched)
         print(f"Henting {(t_pub - t0)/60:.0f} min · publisering "
@@ -843,6 +890,9 @@ def main():
     backfilled = 0
     bad_window = 0
     touched = set()   # kategorier som fikk nye eller endrede prisfiler
+    rescued = load_rescued()
+    rescue_tries = rescued_ok = 0
+    rescue_spent = 0.0
     zoom_tries = 0
     zoom_spent = 0.0
     for i, (_, m) in enumerate(sel.iterrows(), 1):
@@ -877,6 +927,48 @@ def main():
                 zoom = None
 
         if mid in done:
+            # Redning: markedet ble avskrevet fordi interval=max ga ingenting.
+            # Det kallet doer med alder — vinduskall gjor det ikke. Vaermarkeder
+            # havner her fordi de mangler event_start og aldri naar zoom-grenen.
+            if (args.rescue_hours > 0 and mid in nohist
+                    and mid not in rescued
+                    and float(m["volume"] or 0) >= args.rescue_min_volume
+                    and rescue_spent < args.rescue_budget_seconds
+                    and pd.notna(m.get("_end_ts"))):
+                t_r = time.monotonic()
+                rescue_tries += 1
+                end_ts = int(m["_end_ts"])
+                win = (end_ts - args.rescue_hours * 3600, end_ts + 300)
+                rframes, rerr = [], False
+                for j, tok in enumerate(json.loads(m["token_ids"])):
+                    rf = fetch_price_history(tok, 1, window=win)
+                    if rf is ERROR:
+                        rerr = True
+                    elif rf is not None and len(rf):
+                        rf["outcome_index"] = j
+                        rf["fidelity_min"] = 1
+                        rframes.append(rf)
+                    time.sleep(0.12)
+                rescue_spent += time.monotonic() - t_r
+                # En serie uten prisvariasjon er baaret fremover fra ingenting.
+                # Aa lagre den ville lage markeder som ser handlet ut men ikke er det.
+                if rframes and pd.concat(rframes)["price"].nunique() > 1:
+                    out_dir = PRICES_DIR / m["category"]
+                    out_dir.mkdir(exist_ok=True)
+                    merge_price_file(out_dir / f"{mid}.parquet", rframes)
+                    touched.add(m["category"])
+                    on_disk_new.add(mid)
+                    nohist.discard(mid)
+                    rescued_ok += 1
+                if not rerr:
+                    rescued.add(mid)
+                if rescue_tries % 25 == 0:
+                    save_rescued(rescued)
+                    save_nohistory(nohist)
+                    print(f"  redning: {rescued_ok} markeder gjenvunnet av "
+                          f"{rescue_tries} forsok · {rescue_spent/60:.0f} min brukt",
+                          flush=True)
+                continue
             if zoom is None or mid in zoomdone or zoom_spent >= args.zoom_budget_seconds:
                 continue
             # Etterfylling: kun vindus-kallet. Den grove historikken finnes alt,
@@ -980,6 +1072,7 @@ def main():
             save_checkpoint(done)
             save_nohistory(nohist)
             save_zoomed(zoomdone)
+            save_rescued(rescued)
             print(f"  {i}/{len(sel)} sjekket · {zoomed} finkornede vinduer "
                   f"· {backfilled} etterfylte · {len(on_disk_new)} nye prisfiler "
                   f"· {len(nohist)} uten historikk"
@@ -988,6 +1081,7 @@ def main():
     save_checkpoint(done)
     save_nohistory(nohist)
     save_zoomed(zoomdone)
+    save_rescued(rescued)
     t_pub = time.monotonic()
     publish(markets, touched)
     print(f"Henting {(t_pub - t0)/60:.0f} min · publisering {(time.monotonic() - t_pub)/60:.0f} min "
@@ -996,6 +1090,8 @@ def main():
           f"{zoomed} nye markeder fikk finkornet vindu, {backfilled} eldre ble etterfylt "
           f"({len(zoomdone)} av {len(_z)} kvalifiserte er naa daekket)."
           + (f" {bad_window} markeder hadde ugyldig vindus-tidsstempel." if bad_window else "")
+          + (f" Redning: {rescued_ok} av {rescue_tries} forsokte markeder uten "
+             f"historikk ga data likevel." if rescue_tries else "")
           + (f" {err_skipped} markeder ble utsatt pga. serverfeil og provers neste kjoring."
              if err_skipped else ""))
 
