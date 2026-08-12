@@ -12,6 +12,8 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import requests
 
 GAMMA = "https://gamma-api.polymarket.com"
@@ -508,6 +510,28 @@ def cross_fill(df):
 
 SCHEMA = 4
 
+# Fast kolonnerekkefolge i de publiserte prisfilene. ParquetWriter krever samme
+# skjema for hver write_table, og markedsfilene varierer litt.
+PRICE_COLS = ["market_id", "outcome_index", "timestamp", "ts_epoch",
+              "price", "fidelity_min", "derived"]
+ROWGROUP = 400_000       # rader per radgruppe i de publiserte filene
+
+
+def skriv_blokk(writers, pub, kategori, maaned, buffer, bufret):
+    """Toem bufferet for en maaned ut i én radgruppe."""
+    deler = buffer.pop(maaned, None)
+    bufret[maaned] = 0
+    if not deler:
+        return
+    tbl = pa.Table.from_pandas(pd.concat(deler, ignore_index=True),
+                               preserve_index=False)
+    if maaned not in writers:
+        out = pub / f"prices-{kategori}-{maaned}.parquet"
+        writers[maaned] = [pq.ParquetWriter(out, tbl.schema), out]
+    w = writers[maaned]
+    w[0].write_table(tbl if tbl.schema.equals(w[0].schema_arrow)
+                     else tbl.cast(w[0].schema_arrow))
+
 
 def publish(markets, touched=None):
     """Slaa sammen prisfiler per kategori og legg alt klart for opplasting.
@@ -553,38 +577,56 @@ def publish(markets, touched=None):
             hoppet.append(catdir.name)
             ferdig.unlink(missing_ok=True)
             continue
-        frames = []
+        # Delt per maaned, og STROMMET. En samlet vaerfil var 190 MB og sprengte
+        # DuckDB-WASM (32-bits, ~4 GB adressetak — en vegg innstillinger ikke kan
+        # flytte). Foerste forsok bygde hele kategorien i minnet og delte den med
+        # groupby; det tok livet av GitHub-runneren, fordi groupby legger en kopi
+        # oppaa en tabell som allerede var stor. Naa skrives hvert marked rett ut
+        # i maanedsfila si, saa toppminnet er ETT marked og ikke hele kategorien.
+        # Maaneden foelger prispunktet, ikke oppgjoret: et marked som handles over
+        # et maanedsskifte skal ligge i begge filene, ellers forsvinner halve
+        # kurven naar brukeren velger en periode.
+        writers, maaneder = {}, {}
+        buffer, bufret = {}, {}
+        n_markeder = n_rader = n_derived = 0
         for f in catdir.glob("*.parquet"):
-            df = pd.read_parquet(f)
+            df = cross_fill(pd.read_parquet(f))
+            if df.empty:
+                continue
             df["market_id"] = f.stem
-            frames.append(cross_fill(df))
-        if not frames:
+            df["ts_epoch"] = to_epoch(df["timestamp"])
+            # Fast kolonneliste: markedsfilene varierer litt, og en ustabil
+            # skjema-rekkefolge faar ParquetWriter til aa avvise skrivingen.
+            df = df.reindex(columns=PRICE_COLS)
+            n_markeder += 1
+            n_rader += len(df)
+            n_derived += int(df["derived"].sum())
+            nokler = pd.to_datetime(df["timestamp"], utc=True).dt.strftime("%Y-%m")
+            for maaned, del_ in df.groupby(nokler, sort=False):
+                buffer.setdefault(maaned, []).append(del_)
+                bufret[maaned] = bufret.get(maaned, 0) + len(del_)
+                maaneder[maaned] = maaneder.get(maaned, 0) + len(del_)
+                # Ett marked per radgruppe ville gitt titusenvis av bittesmaa
+                # radgrupper — mye overhead og treg lesing. Vi samler opp til en
+                # fornuftig blokk foerst. Toppminnet er da en blokk per maaned,
+                # ikke hele kategorien.
+                if bufret[maaned] >= ROWGROUP:
+                    skriv_blokk(writers, pub, catdir.name, maaned, buffer, bufret)
+        for maaned in list(buffer):
+            skriv_blokk(writers, pub, catdir.name, maaned, buffer, bufret)
+        for w in writers.values():
+            w[0].close()
+        if not writers:
             continue
-        big = pd.concat(frames, ignore_index=True)
-        big["ts_epoch"] = to_epoch(big["timestamp"])
-
-        # Delt per maaned. En samlet vaerfil var 190 MB og sprengte DuckDB-WASM,
-        # som er 32-bits med ~4 GB adressetak — en vegg innstillinger ikke kan
-        # flytte. Arkivet vokser hver natt, saa dette blir bare verre. Nettsiden
-        # laster naa de maanedene brukeren faktisk ber om.
-        # Maaneden foelger prispunktet, ikke oppgjoret: et marked som handles
-        # over et aarsskifte skal ligge i begge filene, ellers forsvinner halve
-        # kurven naar man velger en periode.
-        maaneder = {}
-        for maaned, del_ in big.groupby(
-                pd.to_datetime(big["timestamp"], utc=True).dt.strftime("%Y-%m")):
-            out = pub / f"prices-{catdir.name}-{maaned}.parquet"
-            del_.to_parquet(out, index=False)
-            maaneder[maaned] = {"rows": int(len(del_)),
-                                "bytes": out.stat().st_size}
         # Rydd bort den udelte fila fra schema 3, ellers blir den liggende i R2
         # og nettsiden kan komme til aa lese den.
         (pub / f"prices-{catdir.name}.parquet").unlink(missing_ok=True)
         manifest["categories"][catdir.name] = {
-            "markets": len(frames), "rows": int(len(big)),
-            "derived": int(big["derived"].sum()) if "derived" in big.columns else 0,
-            "bytes": sum(m["bytes"] for m in maaneder.values()),
-            "months": dict(sorted(maaneder.items())),
+            "markets": n_markeder, "rows": n_rader, "derived": n_derived,
+            "bytes": sum(w[1].stat().st_size for w in writers.values()),
+            "months": {m: {"rows": maaneder[m],
+                           "bytes": writers[m][1].stat().st_size}
+                       for m in sorted(maaneder)},
         }
     mk = markets.copy()
     mk["start_epoch"] = to_epoch(mk["start_date"])
