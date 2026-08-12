@@ -527,10 +527,12 @@ def skriv_blokk(writers, pub, kategori, maaned, buffer, bufret):
                                preserve_index=False)
     if maaned not in writers:
         out = pub / f"prices-{kategori}-{maaned}.parquet"
-        writers[maaned] = [pq.ParquetWriter(out, tbl.schema), out]
+        # Skjemaet tas vare paa selv. ParquetWriter eksponerer det under ulike
+        # navn i ulike pyarrow-versjoner (`schema_arrow` finnes ikke overalt),
+        # og aa lese det av writeren kostet en hel kjoring paa 2t57m.
+        writers[maaned] = [pq.ParquetWriter(out, tbl.schema), out, tbl.schema]
     w = writers[maaned]
-    w[0].write_table(tbl if tbl.schema.equals(w[0].schema_arrow)
-                     else tbl.cast(w[0].schema_arrow))
+    w[0].write_table(tbl if tbl.schema.equals(w[2]) else tbl.cast(w[2]))
 
 
 def publish(markets, touched=None):
