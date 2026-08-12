@@ -506,7 +506,7 @@ def cross_fill(df):
                .drop_duplicates(subset=["outcome_index", "timestamp"], keep="first"))
 
 
-SCHEMA = 3
+SCHEMA = 4
 
 
 def publish(markets, touched=None):
@@ -562,12 +562,29 @@ def publish(markets, touched=None):
             continue
         big = pd.concat(frames, ignore_index=True)
         big["ts_epoch"] = to_epoch(big["timestamp"])
-        out = pub / f"prices-{catdir.name}.parquet"
-        big.to_parquet(out, index=False)
+
+        # Delt per maaned. En samlet vaerfil var 190 MB og sprengte DuckDB-WASM,
+        # som er 32-bits med ~4 GB adressetak — en vegg innstillinger ikke kan
+        # flytte. Arkivet vokser hver natt, saa dette blir bare verre. Nettsiden
+        # laster naa de maanedene brukeren faktisk ber om.
+        # Maaneden foelger prispunktet, ikke oppgjoret: et marked som handles
+        # over et aarsskifte skal ligge i begge filene, ellers forsvinner halve
+        # kurven naar man velger en periode.
+        maaneder = {}
+        for maaned, del_ in big.groupby(
+                pd.to_datetime(big["timestamp"], utc=True).dt.strftime("%Y-%m")):
+            out = pub / f"prices-{catdir.name}-{maaned}.parquet"
+            del_.to_parquet(out, index=False)
+            maaneder[maaned] = {"rows": int(len(del_)),
+                                "bytes": out.stat().st_size}
+        # Rydd bort den udelte fila fra schema 3, ellers blir den liggende i R2
+        # og nettsiden kan komme til aa lese den.
+        (pub / f"prices-{catdir.name}.parquet").unlink(missing_ok=True)
         manifest["categories"][catdir.name] = {
             "markets": len(frames), "rows": int(len(big)),
             "derived": int(big["derived"].sum()) if "derived" in big.columns else 0,
-            "bytes": out.stat().st_size,
+            "bytes": sum(m["bytes"] for m in maaneder.values()),
+            "months": dict(sorted(maaneder.items())),
         }
     mk = markets.copy()
     mk["start_epoch"] = to_epoch(mk["start_date"])
@@ -582,7 +599,7 @@ def publish(markets, touched=None):
     if hoppet:
         print(f"  uendret siden sist, ikke bygget om: {', '.join(hoppet)}", flush=True)
     print(f"Publisert {len(manifest['categories'])} kategorier til data/publish/ "
-          f"(schema 3: epoch-kolonner + kryssutfylling). "
+          f"(schema 4: epoch-kolonner, kryssutfylling, delt per maaned). "
           f"{tot:,} rader, herav {der:,} speilet fra motparten "
           f"({der/tot:.0%})" if tot else "Publisert 0 kategorier", flush=True)
 
