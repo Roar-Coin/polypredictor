@@ -99,12 +99,21 @@ def velg_markeder(min_volume, horizon_hours, max_markets):
     Sorteres paa naerhet til oppgjor, ikke paa volum: det er minuttene for
     oppgjor som er uerstattelige, og et marked som gjores opp om ti minutter
     faar aldri en ny sjanse."""
+    # Gamma kapper limit til 100 og offset til 2100 — over det svarer den 422.
+    # Med limit=500 kom det derfor EN side med 100 markeder tilbake, og
+    # `len(batch) < 500` leste det som siste side. Utvalget ble de 100 forste
+    # markedene i API-ets egen rekkefolge, aldri de som faktisk sto naermest
+    # oppgjor: 14. november ga det 6 markeder, alle fotball, av 238 som fantes
+    # over $250 i vinduet. Derfor hentes sorteringen fra serveren, slik at side
+    # 1 er de mest uerstattelige og taket pa 2100 ikke lenger betyr noe.
+    SIDE = 100
     naa = datetime.now(timezone.utc)
     grense = naa + timedelta(hours=horizon_hours)
     ut, offset = [], 0
-    while offset < 20000:
+    while offset <= 2000:
         batch = get_json(f"{GAMMA}/markets", {
-            "closed": "false", "limit": 500, "offset": offset,
+            "closed": "false", "limit": SIDE, "offset": offset,
+            "order": "endDate", "ascending": "true",
             "end_date_min": naa.isoformat().replace("+00:00", "Z"),
             "end_date_max": grense.isoformat().replace("+00:00", "Z"),
             "include_tag": "true",
@@ -127,9 +136,12 @@ def velg_markeder(min_volume, horizon_hours, max_markets):
             ut.append({"market_id": str(m.get("id")), "question": m.get("question"),
                        "category": categorize(m), "tokens": toks[:2],
                        "end_ts": int(slutt.timestamp()), "volume": vol})
-        if len(batch) < 500:
+        # Sortert stigende pa sluttdato: har vi taket fullt, er resten lenger unna.
+        if len(ut) >= max_markets:
             break
-        offset += 500
+        if len(batch) < SIDE:
+            break
+        offset += SIDE
     ut.sort(key=lambda r: r["end_ts"])
     return ut[:max_markets]
 
