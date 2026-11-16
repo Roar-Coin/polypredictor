@@ -1,0 +1,47 @@
+# Slaar sammen ordrebok-opptakene til en fil per dag og skriver books/index.json.
+#
+# Egen arbeidsflyt, ikke et steg i bookrecorder: opptakeren kjorer 4t50m og skal
+# ikke roeres naar den endelig virker, og indeksen maa kunne kjores naar som
+# helst uten aa starte et skift. Den tar under et minutt.
+#
+# Kjorer 05:40 UTC, etter at nattskiftet (00:03) har lastet opp. Raafilene
+# slettes aldri — books/daily/ er en kopi for lesing, ikke en erstatning.
+
+name: bookindex
+
+on:
+  schedule:
+    - cron: "40 5 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: hindsight-bookindex
+  cancel-in-progress: false
+
+env:
+  R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+
+jobs:
+  index:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install --quiet pandas pyarrow awscli
+
+      - name: Slaa sammen og indeksér
+        run: |
+          if [ -z "$R2_ACCOUNT_ID" ]; then
+            echo "R2-secrets ikke satt."; exit 1
+          fi
+          python bookindex.py
