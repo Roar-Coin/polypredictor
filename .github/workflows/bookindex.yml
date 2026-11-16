@@ -2,10 +2,15 @@
 #
 # Egen arbeidsflyt, ikke et steg i bookrecorder: opptakeren kjorer 4t50m og skal
 # ikke roeres naar den endelig virker, og indeksen maa kunne kjores naar som
-# helst uten aa starte et skift. Den tar under et minutt.
+# helst uten aa starte et skift.
 #
-# Kjorer 05:40 UTC, etter at nattskiftet (00:03) har lastet opp. Raafilene
-# slettes aldri — books/daily/ er en kopi for lesing, ikke en erstatning.
+# Arkivet gaar tilbake til september, saa forste gangs opprydding tar flere
+# kjoringer. Jobben tar nyeste dag forst, skriver indeksen etter hver dag, og
+# stopper rent paa --max-seconds. Kjor den om igjen til loggen slutter aa si
+# GJENSTAAR. Etterpaa er det en dag per gang, og den er ferdig paa et minutt.
+#
+# Raafilene slettes aldri — books/daily/ er en kopi for lesing, ikke en
+# erstatning.
 
 name: bookindex
 
@@ -13,6 +18,13 @@ on:
   schedule:
     - cron: "40 5 * * *"
   workflow_dispatch:
+    inputs:
+      max_seconds:
+        description: "Tidsbudsjett for sammenslaaingen (2400 = 40 min)"
+        default: "2400"
+      days:
+        description: "Bare de N nyeste dagene (0 = alle)"
+        default: "0"
 
 concurrency:
   group: hindsight-bookindex
@@ -28,7 +40,7 @@ env:
 jobs:
   index:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
 
@@ -44,4 +56,10 @@ jobs:
           if [ -z "$R2_ACCOUNT_ID" ]; then
             echo "R2-secrets ikke satt."; exit 1
           fi
-          python bookindex.py
+          # Over tusen smaa filer per dag: standard 10 samtidige forespoersler
+          # er det som gjor nedlastingen treg, ikke baandbredden.
+          aws configure set default.s3.max_concurrent_requests 64
+          aws configure set default.s3.max_queue_size 10000
+          python bookindex.py \
+            --max-seconds ${{ inputs.max_seconds || '2400' }} \
+            --days ${{ inputs.days || '0' }}
