@@ -20,8 +20,8 @@ on:
   workflow_dispatch:
     inputs:
       max_seconds:
-        description: "Tidsbudsjett for sammenslaaingen (2400 = 40 min)"
-        default: "2400"
+        description: "Tidsbudsjett for sammenslaaingen (1800 = 30 min)"
+        default: "1800"
       days:
         description: "Bare de N nyeste dagene (0 = alle)"
         default: "0"
@@ -49,7 +49,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install deps
-        run: pip install --quiet pandas pyarrow awscli
+        run: pip install --quiet requests pandas pyarrow awscli
 
       - name: Slaa sammen og indeksér
         run: |
@@ -61,5 +61,10 @@ jobs:
           aws configure set default.s3.max_concurrent_requests 64
           aws configure set default.s3.max_queue_size 10000
           python bookindex.py \
-            --max-seconds ${{ inputs.max_seconds || '2400' }} \
+            --max-seconds ${{ inputs.max_seconds || '1800' }} \
             --days ${{ inputs.days || '0' }}
+
+      # Hvem som faktisk vant, hentet fra Gamma. Trengs for alt som handler om
+      # lonnsomhet og ikke bare kostnad. Inkrementell, nyeste markeder forst.
+      - name: Hent utfall
+        run: python bookoutcomes.py --max-seconds 1080
